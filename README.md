@@ -212,7 +212,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-trove v1.0.0 (15 tools)
+  ✓ hermes-trove v1.1.4 (15 tools)
 
 Provider Plugins:
   Context Engine: trove

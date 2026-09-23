@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_trove import tools as trove_tools
+from hermes_trove.runtime_identity import _plugin_metadata as _manifest_metadata
 import hermes_trove.command as command_mod
 from hermes_trove.command import _fmt_size, handle_trove_command
 from hermes_trove.config import TROVEConfig
@@ -417,7 +418,7 @@ def test_trove_status_reports_runtime_identity(engine):
     repo_root = Path(__file__).resolve().parent.parent
 
     assert "plugin_name: hermes-trove" in result
-    assert "plugin_version: 1.0.0" in result
+    assert f"plugin_version: {_manifest_metadata()['version']}" in result
     assert f"plugin_path: {repo_root}" in result
     assert "module_path:" in result
     assert "database_path_source: config.database_path" in result
@@ -457,7 +458,7 @@ def test_trove_doctor_reports_health_checks(engine):
     assert "messages_fts: ok" in result
     assert "nodes_fts: ok" in result
     assert "plugin_name: hermes-trove" in result
-    assert "plugin_version: 1.0.0" in result
+    assert f"plugin_version: {_manifest_metadata()['version']}" in result
     assert f"plugin_path: {repo_root}" in result
     assert "plugin_git_commit:" in result
     assert "triage_guidance:\n- none" in result

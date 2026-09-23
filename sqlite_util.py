@@ -92,10 +92,14 @@ def _remove_stale_shm_sidecar(db_path: Path) -> bool:
         shm = db_path.with_name(db_path.name + "-shm")
         wal = db_path.with_name(db_path.name + "-wal")
         try:
-            shm_stat = shm.stat()
+            shm_stat = shm.lstat()
         except FileNotFoundError:
             return False
-        if not stat.S_ISREG(shm_stat.st_mode):
+        # Only ever unlink a REAL, single-link regular file. A symlink or
+        # hardlinked shm may be pointing at (or sharing storage with) an
+        # unrelated file; deleting it would bypass the storage-permission
+        # validator's link refusal below. Leave it for the validator.
+        if not stat.S_ISREG(shm_stat.st_mode) or shm_stat.st_nlink != 1:
             return False
         try:
             wal_size: int | None = wal.stat().st_size

@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+
+from hermes_trove.runtime_identity import _plugin_metadata
 from pathlib import Path
 import importlib
 import importlib.util
@@ -425,7 +427,7 @@ def test_plugin_entrypoint_registers_trove_context_engine():
     identity = engine.get_status()["runtime_identity"]
     repo_root = Path(__file__).resolve().parent.parent
     assert identity["plugin_name"] == "hermes-trove"
-    assert identity["plugin_version"] == "1.0.0"
+    assert identity["plugin_version"] == _plugin_metadata()["version"]
     assert Path(identity["plugin_path"]) == repo_root
     assert identity["database_path_source"] in {"config.database_path", "hermes_home", "default_home"}
     assert identity["plugin_git_commit"]

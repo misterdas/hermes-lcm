@@ -23,7 +23,7 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
   digest remains re-derivable from every gated result.  Default-off; every
   other mode is byte-identical to its previous behavior.
 
-## Unreleased
+## v1.1.4 - 2026-09-22
 
 ### Added
 
