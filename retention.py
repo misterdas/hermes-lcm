@@ -50,11 +50,11 @@ def evaluate_retention(
     protected_session_ids: set[str],
     now: float | None = None,
 ) -> RetentionPlan:
-    """Evaluate retention candidates from ``scan_session_retention_stats`` rows.
+    """Evaluate retention candidates from ``scan_session_cleanup_stats_with_age`` rows.
 
     Rows are ``(session_id, message_count, token_total, node_count,
     node_token_total, first_message_at, last_message_at, first_node_at,
-    last_node_at)`` as returned by ``TROVEStore.scan_session_retention_stats``.
+    last_node_at)`` as returned by ``TROVEStore.scan_session_cleanup_stats_with_age`` (store-wide scan).
 
     Eligibility (ALL must hold):
       - ``retention_days > 0`` (default 0 disables everything)
