@@ -21,6 +21,45 @@ from typing import Iterator, List
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 
+# --- stale shared-memory cleanup (t3) ------------------------------------
+#
+# The -shm file is pure derived state: a rebuildable index over -wal frames.
+# When the -wal goes missing or empty (checkpoint completed, process killed
+# mid-recovery, stale sidecars from an earlier incarnation), a leftover -shm
+# can confuse the next opener's shm attach and is never load-bearing. Drop it
+# before SQLite opens the database. This deliberately never touches the main
+# .db file or a non-empty -wal (which may still hold uncheckpointed frames).
+
+
+def _remove_stale_shm_sidecar(db_path: Path) -> bool:
+    """Remove a stale -shm sidecar when there is no WAL content to index.
+
+    Returns True when a file was removed. Never raises: cleanup is
+    best-effort and SQLite itself tolerates (or rebuilds) a missing -shm.
+    """
+    try:
+        shm = db_path.with_name(db_path.name + "-shm")
+        wal = db_path.with_name(db_path.name + "-wal")
+        try:
+            shm_stat = shm.stat()
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(shm_stat.st_mode):
+            return False
+        wal_size: int | None
+        try:
+            wal_size = wal.stat().st_size
+        except FileNotFoundError:
+            wal_size = None
+        if wal_size is not None and wal_size > 0:
+            return False
+        shm.unlink()
+        return True
+    except OSError:
+        return False
+
+
+
 def _sqlite_artifact_error(path: Path, reason: str) -> OSError:
     return OSError(errno.EPERM, f"refusing SQLite artifact {path.name!r}: {reason}", str(path))
 
@@ -237,3 +276,74 @@ def _temporary_sqlite_busy_timeout(
     finally:
         for conn, original in reversed(originals):
             conn.execute(f"PRAGMA busy_timeout={original}")
+
+
+# --- startup index self-heal ---------------------------------------------
+#
+# Observed in production (Sep 2026): under multi-process WAL concurrency the
+# ``sqlite_autoindex_metadata_1`` entry for a metadata row can go missing
+# while the row itself remains present. ``PRAGMA quick_check`` does not catch
+# it (it skips index-vs-table cross-checks); ``PRAGMA integrity_check`` does.
+# Rather than quarantining or renaming the database (which would strand other
+# processes' open file descriptors on deleted inodes), the store verifies on
+# open and rebuilds the damaged index in place. Row data is never touched.
+
+_STARTUP_SELF_HEAL_QUICK_CHECK = "quick_check"
+
+# Cap on index rebuilds per store open: integrity_check is O(db size), and on
+# a healthy DB this path costs one check at process boot (rare). A corrupt
+# index is an exceptional event, so a single bounded rebuild attempt is right.
+_STARTUP_SELF_HEAL_MAX_ATTEMPTS = 1
+
+
+def _is_index_corruption_detail(detail: object) -> bool:
+    """Return True when an integrity_check detail names a missing-wrong index row."""
+    message = str(detail or "").lower()
+    return bool(message) and ("missing from index" in message or "wrong # of entries in index" in message)
+
+
+def _integrity_failure_details(conn: sqlite3.Connection) -> list[str]:
+    """Run PRAGMA integrity_check and return the raw failure detail rows."""
+    try:
+        rows = conn.execute("PRAGMA integrity_check").fetchall()
+    except sqlite3.Error:
+        return []
+    details = [str(row[0]) for row in rows if row and str(row[0]).lower() != "ok"]
+    return details
+
+
+def startup_index_self_heal(conn: sqlite3.Connection) -> dict[str, object]:
+    """Verify b-tree/index consistency on open, rebuilding damaged indexes.
+
+    Runs the full ``PRAGMA integrity_check`` cross-check on every store open
+    (process boot is rare, so the O(db size) cost is acceptable — and it is
+    the only pragma that catches index-vs-table drift; ``quick_check``
+    provably misses this fault class in production). When the failure details
+    name only missing/wrong index rows, it runs the minimal in-place
+    ``REINDEX``. Data rows are never modified, the database file is never
+    renamed or moved, and sibling processes' open connections are unaffected.
+    Genuine page-level or structural damage is never auto-repaired; it is
+    returned for the doctor to surface.
+
+    Returns ``{"healed": bool, "details": [...]}``.
+    """
+    details = _integrity_failure_details(conn)
+    if not details:
+        return {"healed": False, "details": []}
+    if not any(_is_index_corruption_detail(detail) for detail in details):
+        # Genuine page-level or structural damage — not an index-only fault.
+        # Never attempt to "fix" that automatically; surface it to the doctor.
+        return {"healed": False, "details": details}
+    healed = False
+    for _ in range(_STARTUP_SELF_HEAL_MAX_ATTEMPTS):
+        try:
+            conn.execute("REINDEX")
+        except sqlite3.Error:
+            break
+        remaining = _integrity_failure_details(conn)
+        if not remaining:
+            healed = True
+            details = []
+            break
+        details = remaining
+    return {"healed": healed, "details": details}

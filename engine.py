@@ -1485,6 +1485,50 @@ class TROVEEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySes
     def _record_ingest_success(self) -> None:
         self._consecutive_ingest_failures = 0
 
+    def _is_retry_worthy_ingest_error(self, exc: BaseException) -> bool:
+        """Return True for transient SQLite contention worth one more attempt.
+
+        Covers ``database is locked`` / ``database table is locked`` and
+        busy-timeout expiries — the contention a second process's write or a
+        checkpoint can briefly cause under multi-process WAL concurrency.
+        Corruption, disk I/O, constraint, and schema errors are *not*
+        retriable: retrying those cannot help and only delays surfacing.
+        """
+        message = str(exc).lower() if exc is not None else ""
+        if isinstance(exc, sqlite3.Error) and "locked" in message:
+            return True
+        return any(
+            marker in message
+            for marker in ("database is locked", "database table is locked", "busy")
+        ) and not any(
+            marker in message
+            for marker in ("corrupt", "malformed", "disk i/o", "i/o error", "no such")
+        )
+
+    def _ingest_with_transient_retry(
+        self, messages: List[Dict[str, Any]], *, where: str
+    ) -> None:
+        """Run _ingest_messages once, retrying transient lock contention.
+
+        Bounded to two attempts with a short sleep between them. A persistent
+        failure is recorded (not swallowed) via _record_ingest_failure so the
+        operator sees it and the consecutive-failure counter escalates.
+        """
+        try:
+            self._ingest_messages(messages)
+            return
+        except Exception as first:
+            if not self._is_retry_worthy_ingest_error(first):
+                raise
+            time.sleep(0.05)
+            try:
+                self._ingest_messages(messages)
+                return
+            except Exception as second:
+                if self._is_retry_worthy_ingest_error(second):
+                    raise second
+                raise second from first
+
     def _record_ingest_failure(self, where: str, error: Exception) -> None:
         """Track a swallowed ingest error so it is operator-visible.
 
@@ -1740,7 +1784,7 @@ class TROVEEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySes
                         messages,
                         conversation_id=self._conversation_id,
                     )
-                    self._ingest_messages(messages)
+                    self._ingest_with_transient_retry(messages, where="per-turn ingest()")
                     self._record_ingest_success()
                     self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                     logger.debug(
@@ -3926,7 +3970,7 @@ class TROVEEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySes
                     self._session_ignored or self._session_stateless or self._thread_context_stateless()
                 ):
                     try:
-                        self._ingest_messages(messages)
+                        self._ingest_with_transient_retry(messages, where="tool-call ingest")
                         self._record_ingest_success()
                         self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                     except Exception as e:

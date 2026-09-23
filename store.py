@@ -57,8 +57,10 @@ from .search_query import (
 from .message_content import normalize_content_value as _normalize_content_value
 from .sqlite_util import (
     _prepare_private_sqlite_file,
+    _remove_stale_shm_sidecar,
     _restrict_existing_sqlite_artifacts,
     _temporary_sqlite_busy_timeout,
+    startup_index_self_heal,
 )
 from .tokens import count_message_tokens
 
@@ -146,6 +148,10 @@ def _prepare_private_sqlite_storage(db_path: Path) -> None:
     else:
         _restrict_created_sqlite_directory(db_path.parent)
 
+    # t3: drop a stale -shm sidecar before SQLite attaches to it. The -shm is
+    # derived WAL-index state; when -wal is missing/empty it indexes nothing
+    # and only risks confusing the next opener's shm attach.
+    _remove_stale_shm_sidecar(db_path)
     _prepare_private_sqlite_file(db_path)
 
 
@@ -379,6 +385,30 @@ class MessageStore:
         configure_connection(self._conn)
         if not self._is_memory_database:
             _restrict_existing_sqlite_artifacts(self.db_path)
+            # Startup index self-heal (t2): under multi-process WAL
+            # concurrency a b-tree index can lose a row entry while the row
+            # itself survives. integrity_check is the only pragma that catches
+            # it; quick_check provably misses it. Heal in place with REINDEX
+            # — never rename or move the database file, so sibling processes'
+            # open connections are unaffected.
+            try:
+                heal = startup_index_self_heal(self._conn)
+            except Exception:
+                heal = {"healed": False, "details": ["self-heal probe failed"]}
+            if heal.get("details"):
+                logger.warning(
+                    "TROVE startup index check on %s: %s",
+                    self.db_path, heal["details"],
+                )
+            if heal.get("healed"):
+                logger.warning(
+                    "TROVE startup index self-heal rebuilt indexes on %s",
+                    self.db_path,
+                )
+                try:
+                    self._conn.commit()
+                except sqlite3.Error:
+                    pass
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
