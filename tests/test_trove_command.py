@@ -1037,7 +1037,7 @@ def test_trove_help_on_unknown_subcommand(engine):
 def test_trove_doctor_clean_rejects_unknown_extra_args(engine):
     result = handle_trove_command("doctor clean foo", engine)
 
-    assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, and `retention`" in result
+    assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, `retention`, and `retention apply`" in result
     assert "/trove doctor clean apply" in result
     assert "/trove doctor clean lifecycle" in result
     assert "/trove doctor clean lifecycle apply" in result
