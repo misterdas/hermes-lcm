@@ -49,6 +49,7 @@ from .presets import (
     unsupported_runtime_fields_text,
 )
 from .maintenance import backup_database, rotate_backup_database
+from .retention import RetentionPinRefused
 from .assertion_rebuild import rebuild_assertions
 from .assertion_store import AssertionSchemaUnavailableError, AssertionStore
 from . import rollup_builder
@@ -668,26 +669,12 @@ def _scan_clean_candidates(engine) -> dict[str, Any]:
 
 def _scan_retention_candidates(engine) -> dict[str, Any]:
     now = datetime.now().timestamp()
-    # SQL is scoped to the foreground session so /trove doctor retention
-    # reports the operator's real conversation rather than whatever side
-    # channel (cron tick, debug probe) currently owns engine._session_id.
-    # The "protected" flag below still keys off engine._session_id (the
-    # actively-bound row) because that is the row receiving live writes
-    # from the concurrent run.
-    session_id = engine.current_session_id
-    if not session_id:
-        return {
-            "error": None,
-            "sessions": [],
-            "sessions_analyzed": 0,
-            "stale_sessions_30d": 0,
-            "stale_sessions_90d": 0,
-            "retained_tokens_30d": 0,
-            "retained_tokens_90d": 0,
-            "protected_count": 0,
-        }
+    # Store-wide scope, matching `retention apply`: the operator must preview
+    # exactly what apply would act on. A foreground-only preview over a
+    # store-wide destructive apply is a trap (previews nothing eligible while
+    # apply deletes other sessions' data).
     try:
-        rows = engine._store.scan_session_retention_stats(session_id)
+        rows = engine._store.scan_session_cleanup_stats_with_age()
     except Exception as exc:  # pragma: no cover - defensive
         return {
             "error": str(exc),
@@ -1834,7 +1821,7 @@ def _doctor_retention_text(engine) -> str:
         )
     if len(sessions) > 20:
         lines.append(f"... {len(sessions) - 20} more session(s) omitted")
-    lines.append("note: retention analysis is scoped to the active session only")
+    lines.append("note: retention analysis is store-wide; `retention apply` uses the same scope")
     lines.append("note: stale sessions are listed before fresh ones; within each bucket, candidates are sorted by footprint (tokens/nodes/messages), with protected current-session entries listed after non-protected ones")
     lines.append("note: read-only analysis only — no rows were deleted")
     lines.append("note: if you prune later, create a safety snapshot first with `/trove backup`")
@@ -2005,11 +1992,29 @@ def _doctor_retention_apply_text(engine) -> str:
             "note: retention apply aborted before any rows were deleted",
         ])
 
-    from .retention import evaluate_retention
+    from .retention import evaluate_retention, RetentionPinRefused
+
+    if not getattr(getattr(engine, "_config", None), "retention_apply_enabled", False):
+        return "\n".join([
+            "TROVE doctor retention apply",
+            "status: denied",
+            "error: destructive retention apply is disabled by default",
+            "note: set TROVE_RETENTION_APPLY_ENABLED=true only in trusted operator environments",
+            "note: no rows were deleted",
+        ])
+    if not int(getattr(engine._config, "retention_days", 0) or 0) > 0:
+        return "\n".join([
+            "TROVE doctor retention apply",
+            "status: denied",
+            "error: retention_days is 0 (retain raw messages forever)",
+            "note: set TROVE_RETENTION_DAYS>0 to enable retention cleanup",
+            "note: no rows were deleted",
+        ])
 
     protected = {str(getattr(engine, "_session_id", "") or "")} - {""}
     # Re-scan ALL sessions for policy evaluation: retention is store-wide,
-    # unlike the read-only preview which is scoped to the foreground session.
+    # matching the store-wide read-only preview (`retention apply` scope ==
+    # `doctor retention` scope so the operator previews what would be deleted).
     try:
         rows = engine._store.scan_session_cleanup_stats_with_age()
     except Exception as exc:
@@ -2039,26 +2044,7 @@ def _doctor_retention_apply_text(engine) -> str:
             "note: nothing was deleted",
         ])
 
-    # Pinned messages must never be dropped: refuse sessions that contain any.
     conn = engine._store.connection
-    pinned_rows = []
-    for decision in plan.delete:
-        count = int(conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND pinned = 1",
-            (decision.session_id,),
-        ).fetchone()[0])
-        if count:
-            pinned_rows.append((decision.session_id, count))
-    if pinned_rows:
-        detail = ", ".join(f"{sid} ({cnt} pinned)" for sid, cnt in pinned_rows[:10])
-        return "\n".join([
-            "TROVE doctor retention apply",
-            "status: refused",
-            "error: pinned messages present in eligible sessions",
-            f"pinned_sessions: {detail}",
-            "note: unpin or remove pinned rows first; nothing was deleted",
-        ])
-
     backup = backup_database(engine)
     if not backup["ok"]:
         return "\n".join([
@@ -2072,6 +2058,14 @@ def _doctor_retention_apply_text(engine) -> str:
     session_ids = {d.session_id for d in plan.delete}
     try:
         deleted = _delete_retention_candidates_atomically(engine, session_ids)
+    except RetentionPinRefused as exc:
+        return "\n".join([
+            "TROVE doctor retention apply",
+            "status: refused",
+            "error: pinned messages present in eligible sessions",
+            f"detail: {exc}",
+            "note: unpin these messages first; nothing was deleted",
+        ])
     except sqlite3.Error as exc:
         return "\n".join([
             "TROVE doctor retention apply",
@@ -2133,6 +2127,21 @@ def _delete_retention_candidates_atomically(engine, session_ids: set[str]) -> di
 
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # Pin check INSIDE the transaction: a message pinned after the outer
+        # pre-check ran must still block this delete (TOCTOU guard).
+        pinned_rows = []
+        for sid in sorted(session_ids):
+            count = int(conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ? AND pinned = 1",
+                (sid,),
+            ).fetchone()[0])
+            if count:
+                pinned_rows.append((sid, count))
+        if pinned_rows:
+            raise RetentionPinRefused(
+                "pinned messages present: "
+                + ", ".join(f"{sid} ({cnt})" for sid, cnt in pinned_rows[:10])
+            )
         SummaryDAG.stage_delete_session_scope(conn, session_ids)
         scope_table = SummaryDAG.DELETE_SESSION_SCOPE_TABLE
         deleted_store_ids = [

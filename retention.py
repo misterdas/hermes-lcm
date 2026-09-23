@@ -17,6 +17,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 
+class RetentionPinRefused(RuntimeError):
+    """Raised inside the retention transaction when pinned messages block delete."""
+
+
 @dataclass
 class RetentionDecision:
     """One session's retention verdict."""

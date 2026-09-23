@@ -1315,15 +1315,16 @@ def test_trove_doctor_retention_reports_old_heavy_sessions(tmp_path):
 
     assert "TROVE doctor retention" in result
     assert "status: analysis-ready" in result
-    assert "sessions_analyzed: 1" in result
-    assert "stale_sessions_30d: 0" in result
-    assert "stale_sessions_90d: 0" in result
-    assert "retained_tokens_30d: 0" in result
-    assert "retained_tokens_90d: 0" in result
+    # Store-wide preview (matches retention apply scope): both sessions appear.
+    assert "sessions_analyzed: 2" in result
+    assert "stale_sessions_30d: 1" in result
+    assert "stale_sessions_90d: 1" in result
+    assert "retained_tokens_30d:" in result
+    assert "retained_tokens_90d:" in result
     assert "retention_candidates:" in result
     assert "live-session | protected=yes" in result
-    assert "old-heavy" not in result
-    assert "note: retention analysis is scoped to the active session only" in result
+    assert "old-heavy | protected=no" in result
+    assert "note: retention analysis is store-wide" in result
     assert "note: read-only analysis only — no rows were deleted" in result
 
 
@@ -1350,11 +1351,12 @@ def test_trove_doctor_retention_counts_summary_only_sessions(tmp_path):
 
     result = handle_trove_command("doctor retention", engine)
 
-    assert "sessions_analyzed: 0" in result
-    assert "stale_sessions_30d: 0" in result
-    assert "retained_tokens_30d: 0" in result
-    assert "summary-only" not in result
-    assert "result: no stored sessions found for retention analysis" in result
+    # Store-wide: the summary-only session IS analyzed (but has no raw
+    # messages, so it is never a deletion candidate).
+    assert "sessions_analyzed: 1" in result
+    assert "stale_sessions_30d: 1" in result
+    assert "summary-only" in result
+    assert "result: no stored sessions found for retention analysis" not in result
 
 
 def test_trove_doctor_retention_keeps_stale_sessions_visible_when_list_is_truncated(tmp_path):
@@ -1375,10 +1377,11 @@ def test_trove_doctor_retention_keeps_stale_sessions_visible_when_list_is_trunca
 
     result = handle_trove_command("doctor retention", engine)
 
-    assert "stale_sessions_30d: 0" in result
-    assert "sessions_analyzed: 0" in result
-    assert "stale-small" not in result
-    assert "result: no stored sessions found for retention analysis" in result
+    # Store-wide: all sessions analyzed. Truncation shows the top-20 by
+    # staleness/footprint; the stale session stays visible.
+    assert "sessions_analyzed: 22" in result
+    assert "stale-small" in result
+    assert "result: no stored sessions found for retention analysis" not in result
 
 
 def test_trove_doctor_clean_reports_pattern_matched_junk_candidates(tmp_path):
