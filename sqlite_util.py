@@ -9,6 +9,7 @@ example the session-end timeout budget).
 from __future__ import annotations
 
 import errno
+import fcntl
 import os
 from pathlib import Path
 import sqlite3
@@ -29,10 +30,60 @@ _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 # can confuse the next opener's shm attach and is never load-bearing. Drop it
 # before SQLite opens the database. This deliberately never touches the main
 # .db file or a non-empty -wal (which may still hold uncheckpointed frames).
+#
+# Multi-process safety (2026-09-23 split-brain regression): a -wal can be
+# legitimately 0 bytes at a checkpoint boundary while sibling connections
+# (same OR different process) still use the -shm as their lock/index region.
+# Unlinking it under them desyncs their WAL-index view and surfaces later as
+# "file is not a database". So cleanup only runs when we can prove the sidecar
+# is orphaned: no process holds an open fd on the shm path. Lock probes are
+# NOT sufficient — an idle WAL-mode connection holds no shm lock between
+# transactions but is still attached — so we check open fds directly.
+
+
+def _shm_has_any_attachment(shm_path: Path) -> bool:
+    """True when ANY process (this one included) holds the shm path open.
+
+    Scans /proc/*/fd readlink targets as path strings. Fail-closed: if the
+    scan cannot run (no /proc, permissions), report attached and never delete.
+    """
+    try:
+        self_fds = set(os.listdir("/proc/self/fd"))
+    except OSError:
+        return True
+    target = str(shm_path)
+    try:
+        pids = [e for e in os.listdir("/proc") if e.isdigit()]
+    except OSError:
+        return True
+    for pid in pids:
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            entries = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for entry in entries:
+            if pid == str(os.getpid()) and entry in self_fds:
+                continue  # our own probe fds, checked via self_fds below
+            try:
+                opened = os.readlink(f"{fd_dir}/{entry}")
+            except OSError:
+                continue
+            if opened == target:
+                return True
+    # This process's own fds (readlink under /proc/<pid>/fd can be blocked
+    # for our own entries on hardened kernels; self_fds scan covers them).
+    for entry in self_fds:
+        try:
+            if os.readlink(f"/proc/self/fd/{entry}") == target:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _remove_stale_shm_sidecar(db_path: Path) -> bool:
-    """Remove a stale -shm sidecar when there is no WAL content to index.
+    """Remove a stale -shm sidecar when no connection is attached to it.
 
     Returns True when a file was removed. Never raises: cleanup is
     best-effort and SQLite itself tolerates (or rebuilds) a missing -shm.
@@ -46,12 +97,13 @@ def _remove_stale_shm_sidecar(db_path: Path) -> bool:
             return False
         if not stat.S_ISREG(shm_stat.st_mode):
             return False
-        wal_size: int | None
         try:
-            wal_size = wal.stat().st_size
+            wal_size: int | None = wal.stat().st_size
         except FileNotFoundError:
             wal_size = None
         if wal_size is not None and wal_size > 0:
+            return False
+        if _shm_has_any_attachment(shm):
             return False
         shm.unlink()
         return True

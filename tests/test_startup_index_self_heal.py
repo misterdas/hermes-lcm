@@ -10,7 +10,9 @@ REINDEX on open — never rename or move the database file.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
 from pathlib import Path
 
 from hermes_trove.sqlite_util import (
@@ -126,6 +128,44 @@ class TestStaleShmCleanup:
         self._wal(db).write_bytes(b"")
         assert _remove_stale_shm_sidecar(db) is True
         assert not self._shm(db).exists()
+
+    def test_keeps_shm_when_this_process_holds_it_open(self, tmp_path: Path):
+        # Regression for the 2026-09-23 split-brain: a same-process sibling
+        # connection (MessageStore/SummaryDAG/LifecycleStateStore) holds the
+        # shm open even when the wal is empty. Cleanup must not unlink it.
+        import sqlite3 as _sq
+
+        db = tmp_path / "t.db"
+        conn = _sq.connect(str(db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t(x)")
+        conn.commit()
+        # Force a checkpoint so -wal is empty while -shm stays attached.
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        assert self._shm(db).exists()
+        assert _remove_stale_shm_sidecar(db) is False
+        assert self._shm(db).exists()
+        conn.close()
+
+    def test_keeps_shm_when_other_process_holds_it_open(self, tmp_path: Path):
+        # Cross-process sibling: an open fd anywhere in /proc keeps the shm.
+        db = tmp_path / "t.db"
+        db.write_bytes(b"SQLite format 3\x00")
+        shm = self._shm(db)
+        shm.write_bytes(b"x" * 32768)
+        self._wal(db).write_bytes(b"")
+        shm_fd = os.open(str(shm), os.O_RDONLY)
+        holder = subprocess.Popen(["sleep", "30"], pass_fds=(shm_fd,))
+        os.close(shm_fd)  # parent's copy must close: only the child should hold it
+        try:
+            assert _remove_stale_shm_sidecar(db) is False
+            assert shm.exists()
+        finally:
+            holder.terminate()
+            holder.wait()
+        # After the holder exits, the sidecar is provably orphaned again.
+        assert _remove_stale_shm_sidecar(db) is True
+        assert not shm.exists()
 
 
 class TestRetryWorthyIngestError:
