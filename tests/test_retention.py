@@ -102,20 +102,25 @@ def test_evaluate_retention_fresh_session_skipped():
 # --- command surface ---------------------------------------------------------
 
 
-def test_retention_apply_denied_by_default(tmp_path):
-    engine = _make_engine(tmp_path)
+def test_retention_apply_denied_when_flag_off(tmp_path):
+    engine = _make_engine(tmp_path, retention_apply_enabled=False)
     _add_old_session(engine, "old-done")
     result = handle_trove_command("doctor retention apply", engine)
     assert "status: denied" in result
     assert "TROVE_RETENTION_APPLY_ENABLED" in result
 
 
-def test_retention_apply_denied_when_days_zero(tmp_path):
-    engine = _make_engine(tmp_path, retention_apply_enabled=True)
+def test_retention_apply_noop_when_days_zero(tmp_path):
+    engine = _make_engine(tmp_path, retention_apply_enabled=True)  # flag is True by default now
     _add_old_session(engine, "old-done")
     result = handle_trove_command("doctor retention apply", engine)
-    assert "status: denied" in result
-    assert "retention_days is 0" in result
+    assert "status: ok" in result
+    assert "eligible_sessions: 0" in result
+    assert "nothing was deleted" in result
+    # Raw messages untouched
+    assert engine._store._conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = 'old-done'"
+    ).fetchone()[0] == 3
 
 
 def test_retention_apply_deletes_raws_keeps_summaries(tmp_path):

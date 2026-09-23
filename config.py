@@ -828,10 +828,10 @@ class TROVEConfig:
     # provided it still carries summary nodes (the recallable core). The
     # actively-bound session is always protected regardless of age.
     retention_days: int = 0
-    # Destructive `/trove doctor retention apply` workflow is disabled by
-    # default, mirroring doctor_clean_apply_enabled. Set to true only in
-    # trusted operator environments where retention apply is wanted.
-    retention_apply_enabled: bool = False
+    # Destructive `/trove doctor retention apply` workflow. Enabled by default:
+    # the RETENTION_DAYS number is the safety gate (0 = never delete). Set this
+    # to false only to hard-disable apply on shared/multi-user setups.
+    retention_apply_enabled: bool = True
 
     # -- Temporal rollups ---
     # Disabled by default; the engine's ingest/build hooks are flag-gated.

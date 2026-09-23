@@ -459,7 +459,7 @@ def _help_text(error: str | None = None) -> str:
         "- /trove doctor source: read-only scan for legacy blank-source rows",
         "- /trove doctor source apply: backup-first normalization of legacy blank-source rows to unknown",
         "- /trove doctor retention: read-only retention analysis for stored session footprint and age",
-        "- /trove doctor retention apply: backup-first deletion of stale sessions' RAW messages, keeping summary nodes (requires TROVE_RETENTION_APPLY_ENABLED=true and TROVE_RETENTION_DAYS>0)",
+        "- /trove doctor retention apply: backup-first deletion of stale sessions' RAW messages, keeping summary nodes (TROVE_RETENTION_DAYS is the threshold; set it above 0 to enable. TROVE_RETENTION_APPLY_ENABLED, default true, can hard-disable)",
         "- /trove backup: create a timestamped SQLite backup before any future cleanup workflow",
         "- /trove rotate: preview a tail-preserving in-place compact of the active session (read-only)",
         "- /trove rotate apply: backup-first rotate that advances the lifecycle frontier past pre-tail raw messages",
@@ -1969,23 +1969,21 @@ def _doctor_retention_apply_text(engine) -> str:
 
     Reuses the atomic coordinated-delete so messages + FTS + chunk archives +
     lifecycle rows drop in ONE transaction. Summary nodes are intentionally
-    KEPT (that is the whole point: recall survives via summaries).
+    KEPT (that is the whole point: recall survives through the summaries).
+
+    Gates:
+      - retention_apply_enabled (default True) — hard switch, off only on
+        shared setups where apply must be forbidden.
+      - retention_days (default 0) — the threshold. 0 = nothing is stale, so
+        this is a safe no-op ("nothing old enough"), not a rejection. Set it
+        (e.g. 90) to make sessions older than 90 days eligible.
     """
     if not getattr(getattr(engine, "_config", None), "retention_apply_enabled", False):
         return "\n".join([
             "TROVE doctor retention apply",
             "status: denied",
-            "error: retention apply is disabled by default",
-            "note: set TROVE_RETENTION_APPLY_ENABLED=true only in trusted operator environments",
-            "note: no rows were deleted",
-        ])
-
-    if int(getattr(engine._config, "retention_days", 0) or 0) <= 0:
-        return "\n".join([
-            "TROVE doctor retention apply",
-            "status: denied",
-            "error: retention_days is 0 (retain raw messages forever)",
-            "note: set TROVE_RETENTION_DAYS to a positive number of days first",
+            "error: retention apply is disabled",
+            "note: set TROVE_RETENTION_APPLY_ENABLED=true to enable",
             "note: no rows were deleted",
         ])
 
@@ -1999,23 +1997,6 @@ def _doctor_retention_apply_text(engine) -> str:
         ])
 
     from .retention import evaluate_retention, RetentionPinRefused
-
-    if not getattr(getattr(engine, "_config", None), "retention_apply_enabled", False):
-        return "\n".join([
-            "TROVE doctor retention apply",
-            "status: denied",
-            "error: destructive retention apply is disabled by default",
-            "note: set TROVE_RETENTION_APPLY_ENABLED=true only in trusted operator environments",
-            "note: no rows were deleted",
-        ])
-    if not int(getattr(engine._config, "retention_days", 0) or 0) > 0:
-        return "\n".join([
-            "TROVE doctor retention apply",
-            "status: denied",
-            "error: retention_days is 0 (retain raw messages forever)",
-            "note: set TROVE_RETENTION_DAYS>0 to enable retention cleanup",
-            "note: no rows were deleted",
-        ])
 
     protected = {str(getattr(engine, "_session_id", "") or "")} - {""}
     # Re-scan ALL sessions for policy evaluation: retention is store-wide,
@@ -2035,9 +2016,10 @@ def _doctor_retention_apply_text(engine) -> str:
     if plan.disabled:
         return "\n".join([
             "TROVE doctor retention apply",
-            "status: denied",
-            "error: retention_days is 0 (retain raw messages forever)",
-            "note: no rows were deleted",
+            "status: ok",
+            "eligible_sessions: 0",
+            "note: TROVE_RETENTION_DAYS is 0 (retain raw messages forever); set it to a value above 0 to enable retention cleanup",
+            "note: nothing was deleted",
         ])
     if not plan.delete:
         skip_lines = [f"  - {d.session_id}: {d.reason}" for d in plan.skip[:10]]
