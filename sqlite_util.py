@@ -9,7 +9,6 @@ example the session-end timeout budget).
 from __future__ import annotations
 
 import errno
-import fcntl
 import os
 from pathlib import Path
 import sqlite3
