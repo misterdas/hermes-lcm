@@ -143,6 +143,9 @@ def _warn_externalization_path_outside_base(path: Path, allowed_base: Path) -> N
 
 def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool) -> Path:
     configured = getattr(config, "large_output_externalization_path", "") or ""
+    # Strict mode (TROVE_EXTERNALIZATION_STRICT=true) upgrades out-of-base
+    # externalized-payload paths from warn-once to hard ValueError.
+    strict = getattr(config, "externalization_strict", False)
     if configured:
         path = Path(configured).expanduser().resolve()
         # Check containment for configured paths when TROVE_HERMES_BASE_DIR is set
@@ -162,12 +165,21 @@ def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool)
             try:
                 path.relative_to(allowed_base)
             except ValueError:
+                if strict:
+                    raise ValueError(
+                        f"Externalized-payload path {path} is outside the "
+                        f"hermes_home containment base {allowed_base}; "
+                        f"refusing to write in strict mode "
+                        f"(TROVE_EXTERNALIZATION_STRICT=true). Set "
+                        f"TROVE_HERMES_BASE_DIR to an allowed base to permit "
+                        f"this path."
+                    )
                 _warn_externalization_path_outside_base(path, allowed_base)
     else:
         base = Path(hermes_home).expanduser().resolve() if hermes_home else Path("~/.hermes").expanduser().resolve()
         path = base / DEFAULT_LARGE_OUTPUT_DIRNAME
-        # Check containment within allowed base for default/hermes_home-based paths
-        # Only enforced when TROVE_HERMES_BASE_DIR is explicitly set
+        # Check containment within allowed base for default/hermes_home-based paths.
+        # Hard-raise when TROVE_HERMES_BASE_DIR is set or when strict mode is on.
         env_base = os.environ.get("TROVE_HERMES_BASE_DIR")
         if env_base:
             allowed_base = Path(env_base).expanduser().resolve()
@@ -175,6 +187,16 @@ def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool)
                 path.relative_to(allowed_base)
             except ValueError:
                 raise ValueError(f"Path {path} is not within allowed base {allowed_base}")
+        elif strict:
+            allowed_base = base
+            try:
+                path.relative_to(allowed_base)
+            except ValueError:
+                raise ValueError(
+                    f"Default externalized-payload path {path} is outside the "
+                    f"hermes_home containment base {allowed_base}; refusing to "
+                    f"write in strict mode (TROVE_EXTERNALIZATION_STRICT=true)."
+                )
     if create:
         missing_dirs = _missing_directory_components(path)
         path.mkdir(parents=True, exist_ok=True)

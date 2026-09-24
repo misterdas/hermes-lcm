@@ -410,6 +410,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("large_output_externalization_enabled", "TROVE_LARGE_OUTPUT_EXTERNALIZATION_ENABLED", bool),
     _EnvFieldSpec("large_output_externalization_threshold_chars", "TROVE_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS", int),
     _EnvFieldSpec("large_output_externalization_path", "TROVE_LARGE_OUTPUT_EXTERNALIZATION_PATH", str),
+    _EnvFieldSpec("externalization_strict", "TROVE_EXTERNALIZATION_STRICT", bool),
     _EnvFieldSpec("large_output_active_replay_stubbing_enabled", "TROVE_LARGE_OUTPUT_ACTIVE_REPLAY_STUBBING_ENABLED", bool),
     _EnvFieldSpec("large_output_active_replay_stub_threshold_tokens", "TROVE_LARGE_OUTPUT_ACTIVE_REPLAY_STUB_THRESHOLD_TOKENS", int),
     _EnvFieldSpec("large_output_transcript_gc_enabled", "TROVE_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED", bool),
@@ -623,6 +624,10 @@ class TROVEConfig:
     large_output_externalization_threshold_chars: int = 12_000
     # Explicit storage directory for externalized payloads (empty = auto under hermes home).
     large_output_externalization_path: str = ""
+    # When True, an externalized-payload path outside the containment base raises
+    # ValueError instead of a one-time warning. Defaults to False (warn once) to
+    # keep existing deployments working; opt in via TROVE_EXTERNALIZATION_STRICT=true.
+    externalization_strict: bool = False
     # Replace eligible textual tool results with durable compact refs in
     # provider-visible replay. Current-turn ingest is intercepted immediately;
     # historical assembly separately respects the protected fresh tail. This

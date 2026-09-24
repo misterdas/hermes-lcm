@@ -156,10 +156,28 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
         command = "safe to ignore if compaction proceeds normally; inspect trove_status only if pressure stays high or compaction loops"
         warning_only = True
         rationale = "context pressure is an operating state, not persisted-state corruption"
+    elif name == "ingest_health":
+        last_error = ""
+        if isinstance(detail, dict):
+            last_error = str(detail.get("last_error", "") or "")
+        if status == "fail":
+            command = "ingest is failing — messages may be LOST; inspect disk/storage and last_error above; restore trove.db from backup if storage is healthy but TROVE still cannot persist"
+            rationale = "consecutive ingest failures mean the lossless guarantee is actively breaking"
+            warning_only = False
+        else:
+            command = "past ingest failures recovered; verify no messages were lost and monitor trove_status"
+            action = DOCTOR_ACTION_SAFE_IGNORE
+            warning_only = True
+            rationale = "ingest recovered; failures were transient"
     elif name == "cleanup_candidates":
         action = DOCTOR_ACTION_BACKUP_FIRST_CLEANUP
         command = "run `/trove doctor clean` first; if candidates are expected junk/noise, run `/trove backup` before `/trove doctor clean apply`"
         rationale = "candidate cleanup deletes rows and must stay preview-and-backup gated"
+    elif name == "pii_redaction_and_backup_guardrail":
+        action = DOCTOR_ACTION_INSPECT
+        command = "enable TROVE_SENSITIVE_PATTERNS_ENABLED=1, OR move trove.db outside HERMES_HOME via TROVE_DATABASE_PATH, OR exclude trove.db from the Hermes backup channel"
+        warning_only = True
+        rationale = "PII redaction is OFF and trove.db lives inside HERMES_HOME, which the Hermes backup channel ships to a remote repo — unredacted secrets may leak"
 
     return {
         "check": name,
@@ -168,6 +186,108 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
         "operator_action": command,
         "warning_only": warning_only,
         "rationale": rationale,
+    }
+
+
+def _resolve_db_path_for_engine(engine: Any) -> Path:
+    """Return the resolved trove.db path the engine's store is bound to.
+
+    Read-only diagnostic input — same containment guard as the state-db path
+    helper so a deployment that pins ``TROVE_HERMES_BASE_DIR`` cannot have its
+    database escape into an arbitrary path via a symbolic link or ``~/``
+    expansion.
+    """
+    db_path = Path(getattr(getattr(engine, "_store", None), "db_path", ""))
+    if not db_path or str(db_path) == ":memory:":
+        return Path()
+    return _enforce_state_db_containment(db_path, description=f"TROVE database {db_path}")
+
+
+def _resolve_hermes_home_for_engine(engine: Any) -> Path:
+    """Return the resolved HERMES_HOME the engine is bound to."""
+    hermes_home = getattr(engine, "_hermes_home", "") or ""
+    if not hermes_home:
+        return Path()
+    return _enforce_state_db_containment(
+        Path(hermes_home),
+        description=f"hermes_home {hermes_home}",
+    )
+
+
+def db_path_lives_under_hermes_home(engine: Any) -> bool:
+    """Return whether the active trove.db resides inside HERMES_HOME.
+
+    This is the structural precondition for the Hermes backup channel (which
+    ships ``~/.hermes`` to a remote repo) to capture unredacted secrets from
+    the trove database. When the operator pins ``TROVE_DATABASE_PATH`` to a
+    path outside HERMES_HOME, the precondition is false and the guardrail is
+    not applicable.
+    """
+    db_path = _resolve_db_path_for_engine(engine)
+    hermes_home = _resolve_hermes_home_for_engine(engine)
+    if not db_path or not hermes_home:
+        return False
+    try:
+        db_path.relative_to(hermes_home)
+        return True
+    except ValueError:
+        return False
+
+
+def security_backup_guardrail(engine: Any) -> dict[str, Any]:
+    """Build the read-only PII-plus-backup guardrail check.
+
+    The guardrail fires only when BOTH of the following hold:
+      1. ``sensitive_patterns_enabled`` is False (PII redaction is OFF).
+      2. The active ``trove.db`` lives inside ``HERMES_HOME`` — the tree the
+         Hermes backup channel ships to a remote repo.
+
+    It is deliberately conservative: the default deployment stores
+    ``trove.db`` at ``~/.hermes/trove.db`` with redaction OFF, which means
+    the operator is one ``hermes backup`` away from pushing unredacted API
+    keys, bearer tokens, and private keys to a (possibly public) remote.
+
+    The finding is read-only evidence — it never flips the redaction default
+    and never changes ingest behavior.
+    """
+    config = getattr(engine, "_config", None)
+    redaction_off = not bool(getattr(config, "sensitive_patterns_enabled", False))
+    db_in_home = db_path_lives_under_hermes_home(engine)
+    hermes_home = str(_resolve_hermes_home_for_engine(engine) or "")
+    db_path = str(_resolve_db_path_for_engine(engine) or "")
+
+    if redaction_off and db_in_home:
+        status = "warn"
+        detail = {
+            "redaction_off": True,
+            "db_in_hermes_home": True,
+            "hermes_home": hermes_home,
+            "database_path": db_path,
+            "warning": (
+                "PII redaction is OFF and trove.db lives inside HERMES_HOME "
+                "({hermes_home}), which the Hermes backup channel ships to a "
+                "remote repo. Unredacted secrets (API keys, bearer tokens, "
+                "passwords, private keys) may leak publicly via backup."
+            ),
+            "recommendation": (
+                "Enable TROVE_SENSITIVE_PATTERNS_ENABLED=1, OR move trove.db "
+                "outside HERMES_HOME via TROVE_DATABASE_PATH, OR exclude "
+                "trove.db from the Hermes backup channel."
+            ),
+        }
+    else:
+        status = "pass"
+        detail = {
+            "redaction_off": redaction_off,
+            "db_in_hermes_home": db_in_home,
+            "hermes_home": hermes_home,
+            "database_path": db_path,
+        }
+
+    return {
+        "check": "pii_redaction_and_backup_guardrail",
+        "status": status,
+        "detail": detail,
     }
 
 

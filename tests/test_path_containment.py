@@ -3,6 +3,8 @@ import tempfile
 from pathlib import Path
 import pytest
 
+from hermes_trove.externalize import get_large_output_storage_dir, _WARNED_EXTERNALIZATION_PATHS
+
 
 def test_path_containment_within_allowed_base(monkeypatch):
     """Test that hermes_home within allowed base is accepted."""
@@ -153,3 +155,111 @@ def test_externalization_path_strict_containment_when_base_set(monkeypatch, tmp_
         get_large_output_storage_dir(
             Config(), hermes_home=str(tmp_path / "allowed" / "hermes"), create=False
         )
+
+
+# ---------------------------------------------------------------------------
+# TROVE_EXTERNALIZATION_STRICT (C4 opt-in hard error)
+# ---------------------------------------------------------------------------
+
+
+def _strict_config(path: str = ""):
+    class Config:
+        large_output_externalization_path = path
+        externalization_strict = True
+    return Config()
+
+
+def test_strict_mode_configured_path_outside_base_raises(monkeypatch, tmp_path):
+    """Strict mode: configured externalization path outside hermes_home raises."""
+    monkeypatch.delenv("TROVE_HERMES_BASE_DIR", raising=False)
+    outside = tmp_path / "other-volume" / "payloads"
+
+    with pytest.raises(ValueError, match="refusing to write in strict mode"):
+        get_large_output_storage_dir(
+            _strict_config(str(outside)),
+            hermes_home=str(tmp_path / "hermes"),
+            create=False,
+        )
+
+
+def test_strict_mode_configured_path_inside_base_passes(monkeypatch, tmp_path):
+    """Strict mode: configured path inside hermes_home is still allowed."""
+    monkeypatch.delenv("TROVE_HERMES_BASE_DIR", raising=False)
+    hermes_home = tmp_path / "hermes"
+    inside = hermes_home / "custom-outputs"
+
+    path = get_large_output_storage_dir(
+        _strict_config(str(inside)),
+        hermes_home=str(hermes_home),
+        create=False,
+    )
+    assert path == _resolved(inside)
+
+
+def test_strict_mode_default_path_inside_base_passes(monkeypatch, tmp_path):
+    """Strict mode: default hermes_home/trove-large-outputs is allowed."""
+    monkeypatch.delenv("TROVE_HERMES_BASE_DIR", raising=False)
+    hermes_home = tmp_path / "hermes"
+
+    path = get_large_output_storage_dir(
+        _strict_config(""),
+        hermes_home=str(hermes_home),
+        create=False,
+    )
+    assert path == _resolved(hermes_home / "trove-large-outputs")
+
+
+def test_strict_mode_with_explicit_base_outside_raises(monkeypatch, tmp_path):
+    """Strict mode + TROVE_HERMES_BASE_DIR: outside path still hard-raises."""
+    monkeypatch.setenv("TROVE_HERMES_BASE_DIR", str(tmp_path / "allowed"))
+
+    with pytest.raises(ValueError, match="not within allowed base"):
+        get_large_output_storage_dir(
+            _strict_config(str(tmp_path / "elsewhere" / "payloads")),
+            hermes_home=str(tmp_path / "allowed" / "hermes"),
+            create=False,
+        )
+
+
+def test_strict_mode_with_explicit_base_inside_passes(monkeypatch, tmp_path):
+    """Strict mode + TROVE_HERMES_BASE_DIR: inside path is allowed."""
+    monkeypatch.setenv("TROVE_HERMES_BASE_DIR", str(tmp_path / "allowed"))
+    allowed = tmp_path / "allowed"
+
+    path = get_large_output_storage_dir(
+        _strict_config(str(allowed / "payloads")),
+        hermes_home=str(allowed / "hermes"),
+        create=False,
+    )
+    assert path == _resolved(allowed / "payloads")
+
+
+def test_default_mode_still_warns_and_allows(monkeypatch, caplog, tmp_path):
+    """Default mode (strict=False) keeps the existing warn-once behavior."""
+    import logging
+    from hermes_trove.externalize import _WARNED_EXTERNALIZATION_PATHS
+
+    monkeypatch.delenv("TROVE_HERMES_BASE_DIR", raising=False)
+    _WARNED_EXTERNALIZATION_PATHS.clear()
+
+    class Config:
+        large_output_externalization_path = str(tmp_path / "other" / "payloads")
+        externalization_strict = False
+
+    with caplog.at_level(logging.WARNING):
+        path = get_large_output_storage_dir(
+            Config(),
+            hermes_home=str(tmp_path / "hermes"),
+            create=False,
+        )
+
+    assert path == _resolved(tmp_path / "other" / "payloads")
+    assert any("outside the hermes_home base" in r.message for r in caplog.records)
+
+
+def test_env_var_wires_through_config(monkeypatch):
+    """TROVE_EXTERNALIZATION_STRICT=true sets the config field via from_env."""
+    monkeypatch.setenv("TROVE_EXTERNALIZATION_STRICT", "true")
+    from hermes_trove.config import TROVEConfig
+    cfg = TROVEConfig.from_env()
+    assert cfg.externalization_strict is True

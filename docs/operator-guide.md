@@ -206,6 +206,7 @@ environment variables:
 | `TROVE_LARGE_OUTPUT_ACTIVE_REPLAY_STUBBING_ENABLED` | `false` | Replace token-heavy textual tool results with recoverable externalized refs in active replay; current-turn ingest is immediate and historical assembly respects the protected fresh tail; requires large-output externalization |
 | `TROVE_LARGE_OUTPUT_ACTIVE_REPLAY_STUB_THRESHOLD_TOKENS` | `25000` | Token-aware threshold for active-replay tool-result stubbing |
 | `TROVE_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Rewrite already-externalized summarized tool rows to compact placeholders |
+| `TROVE_EXTERNALIZATION_STRICT` | `false` | Upgrade out-of-base externalized-payload paths from warn-once to hard `ValueError`; see [strict containment](#strict-containment) |
 | `TROVE_CRITICAL_BUDGET_PRESSURE_RATIO` | `0.0` | Disabled at `0.0`; when set, permits critical-pressure bypasses for bounded deferred catch-up and cache-friendly follow-on condensation only |
 | `TROVE_SUMMARY_MODEL` | auxiliary | Override summarization model |
 | `TROVE_SUMMARY_FALLBACK_MODELS` | empty | Comma-separated summarization models tried after `TROVE_SUMMARY_MODEL` or the auxiliary task default fails |
@@ -649,6 +650,36 @@ scans at most 256 files and 512,000 encoded content bytes per file, and returns
 only bounded snippets plus recovery metadata. See the
 [retrieval tools reference](retrieval-tools.md#searching-externalized-payloads)
 for the exact contract.
+
+### Strict containment
+
+By default, an externalized-payload path that escapes its containment base
+(hermes home, or `TROVE_HERMES_BASE_DIR` when set) only logs a one-time warning
+via `_warn_externalization_path_outside_base`. This keeps working deployments
+from breaking when `TROVE_LARGE_OUTPUT_EXTERNALIZATION_PATH` points to a
+different volume, but it means a typo'd or attacker-controlled path still
+writes there.
+
+Enable strict containment to upgrade that warn-once into a hard `ValueError`:
+
+```
+TROVE_EXTERNALIZATION_STRICT=true
+```
+
+When enabled:
+- **Configured path outside base** — if `TROVE_LARGE_OUTPUT_EXTERNALIZATION_PATH`
+  resolves outside the hermes_home (or `TROVE_HERMES_BASE_DIR` when set),
+  `get_large_output_storage_dir` raises `ValueError` instead of logging. The
+  default `~/.hermes/trove-large-outputs` path is inside hermes_home, so it is
+  still permitted.
+- **Default path outside base** — the auto-derived default
+  (`<hermes_home>/trove-large-outputs`) is also checked against strict
+  containment, catching cases where hermes_home itself drifts outside
+  `TROVE_HERMES_BASE_DIR`.
+
+Set `TROVE_HERMES_BASE_DIR` to an explicit allowed base if you intentionally
+store externalized payloads on a separate volume — strict containment then
+checks against that base instead of hermes_home.
 
 The storage-boundary payload guard is separate from that opt-in. TROVE always
 scans messages at the store boundary before writing `messages.content` or

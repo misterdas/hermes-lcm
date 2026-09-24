@@ -30,6 +30,7 @@ from .diagnostics import (
     _has_lifecycle_fragmentation,
     _state_db_path_for_engine,
     doctor_guidance_for_checks,
+    security_backup_guardrail,
 )
 from .ingest_protection import (
     externalized_payload_stats,
@@ -609,6 +610,30 @@ def _status_text(engine) -> str:
         )
     if source_stats.get("error"):
         lines.append(f"source_lineage_error: {source_stats['error']}")
+
+    # Ingest health: a sustained storage fault breaks the lossless guarantee.
+    # Surface the counters prominently when consecutive failures reach the
+    # escalation threshold (>=3) so an operator who never reads logs still
+    # sees the failure as a first-class flag.
+    ingest_failures = int(status.get("ingest_failure_count", 0) or 0)
+    consecutive_failures = int(status.get("consecutive_ingest_failures", 0) or 0)
+    last_ingest_error = str(status.get("last_ingest_error", "") or "")
+    last_ingest_error_time = float(status.get("last_ingest_error_time", 0) or 0)
+    lines.append(f"ingest_total_failures: {ingest_failures}")
+    lines.append(f"ingest_consecutive_failures: {consecutive_failures}")
+    if last_ingest_error:
+        _ts = (
+            datetime.fromtimestamp(last_ingest_error_time, tz=timezone.utc).isoformat(timespec="seconds")
+            if last_ingest_error_time > 0
+            else "(unknown)"
+        )
+        lines.append(f"ingest_last_error: {last_ingest_error} (at {_ts})")
+    if consecutive_failures >= 3:
+        lines.append("ingest_health: ERROR — ingest is failing — messages may be LOST; " +
+                     f"last error: {last_ingest_error}")
+    elif consecutive_failures > 0 or ingest_failures > 0:
+        lines.append("ingest_health: WARN — ingest failures recorded; see details above")
+
     return "\n".join(lines)
 
 
@@ -1659,6 +1684,18 @@ def _doctor_text(engine) -> str:
     if lifecycle_stats.get("error") or _has_lifecycle_fragmentation(lifecycle_stats):
         lifecycle_status = "fail" if lifecycle_stats.get("error") else "warn"
         triage_checks.append({"check": "lifecycle_fragmentation", "status": lifecycle_status, "detail": lifecycle_stats})
+    # 8. PII-redaction-plus-backup guardrail (read-only security finding).
+    #    Surfaces a warning when redaction is OFF and trove.db lives inside
+    #    HERMES_HOME — the tree the Hermes backup channel ships to a remote
+    #    repo. Evidence only; never flips defaults or changes ingest behavior.
+    try:
+        triage_checks.append(security_backup_guardrail(engine))
+    except Exception as e:
+        triage_checks.append({
+            "check": "pii_redaction_and_backup_guardrail",
+            "status": "fail",
+            "detail": str(e),
+        })
     triage_guidance = doctor_guidance_for_checks(triage_checks)
 
     doctor_status = "issues-found" if integrity != "ok" or issues else (

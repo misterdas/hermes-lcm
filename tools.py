@@ -28,6 +28,7 @@ from .diagnostics import (
     _has_lifecycle_fragmentation,
     _state_db_path_for_engine,
     doctor_guidance_for_checks,
+    security_backup_guardrail,
 )
 from .dag import build_nodes_fts_spec
 from .db_bootstrap import (
@@ -6458,6 +6459,22 @@ def trove_status(args: Dict[str, Any], **kwargs) -> str:
     # just reads the property contract.
     side_channel_active = engine.side_channel_active
 
+    # Ingest health: surface the engine's ingest-failure counters so a
+    # sustained storage fault is operator-visible as a first-class flag,
+    # not just log escalation. A consecutive count >= 3 means the lossless
+    # guarantee is actively breaking — call it out prominently.
+    _trove_status_ingest_health = {
+        "consecutive_failures": int(full_status.get("consecutive_ingest_failures", 0) or 0),
+        "total_failures": int(full_status.get("ingest_failure_count", 0) or 0),
+        "last_error": str(full_status.get("last_ingest_error", "") or ""),
+        "last_error_time": float(full_status.get("last_ingest_error_time", 0) or 0),
+    }
+    if _trove_status_ingest_health["consecutive_failures"] >= 3:
+        _trove_status_ingest_health["warning"] = (
+            "ingest is failing — messages may be LOST; "
+            f"last error: {_trove_status_ingest_health['last_error']}"
+        )
+
     return json.dumps({
         "session_id": session_id,
         "compression_count": engine.compression_count,
@@ -6561,6 +6578,7 @@ def trove_status(args: Dict[str, Any], **kwargs) -> str:
         "runtime_identity": runtime_identity,
         "lifecycle": lifecycle,
         "lifecycle_fragmentation": lifecycle_fragmentation,
+        "ingest_health": _trove_status_ingest_health,
     })
 
 
@@ -6894,6 +6912,21 @@ def trove_doctor(args: Dict[str, Any], **kwargs) -> str:
             "check": "context_pressure",
             "status": "pass" if usage_pct < threshold_pct else "warn",
             "detail": f"{usage_pct}% used, compaction triggers at {threshold_pct}%",
+        })
+
+    # 8. PII-redaction-plus-backup guardrail (read-only security finding).
+    #    Surfaces a warning when redaction is OFF and trove.db lives inside
+    #    HERMES_HOME — the tree the Hermes backup channel ships to a remote
+    #    repo. The finding is evidence; it never flips defaults or changes
+    #    ingest behavior. See diagnostics.security_backup_guardrail for the
+    #    exact conditions and recommendation text.
+    try:
+        checks.append(security_backup_guardrail(engine))
+    except Exception as e:
+        checks.append({
+            "check": "pii_redaction_and_backup_guardrail",
+            "status": "fail",
+            "detail": str(e),
         })
 
     overall = "healthy"
