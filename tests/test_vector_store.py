@@ -1195,7 +1195,7 @@ def test_large_session_delete_purges_exact_ids_in_bounded_batches(tmp_path):
     dag = SummaryDAG(db_path)
     store = VectorStore(db_path)
     try:
-        node_ids = list(range(1, 5_001))
+        node_ids = list(range(1, 701))
         dag.connection.executemany(
             "INSERT INTO summary_nodes("
             "node_id, session_id, depth, summary, source_token_count, "

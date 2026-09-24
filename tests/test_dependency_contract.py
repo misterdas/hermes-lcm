@@ -33,9 +33,10 @@ def test_dependency_contract_validator_accepts_repository():
         capture_output=True,
         text=True,
     )
+    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
 
     assert result.returncode == 0, result.stderr
-    assert "dependency contract valid: version 1.0.4" in result.stdout
+    assert f"dependency contract valid: version {contract['contract_version']}" in result.stdout
     assert "9 external imports declared" in result.stdout
 
 
@@ -938,7 +939,7 @@ def test_contract_records_host_ownership_versions_and_update_owner():
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
 
     assert contract["schema_version"] == 1
-    assert contract["contract_version"] == "1.0.4"
+    assert contract["contract_version"] == "1.0.5"
     assert contract["boundary"] == "host-owned"
     assert contract["imported_api_validation"] == "observed-coverage-only"
     assert contract["ownership"]["dependency_resolver"] == "Hermes Agent host environment"
@@ -948,7 +949,7 @@ def test_contract_records_host_ownership_versions_and_update_owner():
         "scanned runtime import, supported Python or Hermes Agent version, or required "
         "imported API changes."
     )
-    assert contract["supported_versions"]["python"] == ["3.11", "3.12", "3.13", "3.14"]
+    assert contract["supported_versions"]["python"] == ["3.11", "3.14"]
     assert contract["supported_versions"]["hermes_agent"] == ">=0.16,<1"
     assert contract["runtime_scan"]["local_imports"] == ["hermes_trove", "benchmarking"]
     assert set(contract["external_imports"]) == {

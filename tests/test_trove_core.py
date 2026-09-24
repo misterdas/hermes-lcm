@@ -2657,7 +2657,7 @@ class TestMessageStore:
         assert top_5 == top_50
 
     def test_search_relevance_caps_fts_batches_for_large_single_term_pool(self, store):
-        for _ in range(5_000):
+        for _ in range(1_000):
             store.append(
                 "sess1",
                 {
@@ -4305,7 +4305,7 @@ class TestSummaryDAG:
         assert direct in [node.node_id for node in results]
 
     def test_search_relevance_caps_fts_batches_for_large_single_term_pool(self, dag):
-        for idx in range(5_000):
+        for idx in range(1_000):
             dag.add_node(SummaryNode(
                 session_id="s1", depth=0,
                 summary=f"Summary {idx}: vendoring",

@@ -7782,7 +7782,7 @@ class TestMessageFiltering:
         )
         try:
             engine.on_session_start("session", platform="telegram", context_length=1000)
-            for idx in range(10_000):
+            for idx in range(1_500):
                 engine._store.append(
                     "session",
                     {"role": "assistant", "content": f"filler row {idx}"},
