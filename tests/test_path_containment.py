@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 import pytest
 
-from hermes_trove.externalize import get_large_output_storage_dir, _WARNED_EXTERNALIZATION_PATHS
+from hermes_trove.externalize import get_large_output_storage_dir
 
 
 def test_path_containment_within_allowed_base(monkeypatch):

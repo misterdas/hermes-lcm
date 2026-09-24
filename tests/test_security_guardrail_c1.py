@@ -14,8 +14,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from hermes_trove import tools as trove_tools
 from hermes_trove.command import handle_trove_command
 from hermes_trove.config import TROVEConfig

@@ -157,9 +157,6 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
         warning_only = True
         rationale = "context pressure is an operating state, not persisted-state corruption"
     elif name == "ingest_health":
-        last_error = ""
-        if isinstance(detail, dict):
-            last_error = str(detail.get("last_error", "") or "")
         if status == "fail":
             command = "ingest is failing — messages may be LOST; inspect disk/storage and last_error above; restore trove.db from backup if storage is healthy but TROVE still cannot persist"
             rationale = "consecutive ingest failures mean the lossless guarantee is actively breaking"

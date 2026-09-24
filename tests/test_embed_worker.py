@@ -11,9 +11,7 @@ import json
 import sqlite3
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 import hermes_trove.command as command_mod
 import hermes_trove.embed_worker as worker_mod
@@ -197,7 +195,6 @@ def test_debounce_coalesces_burst(tmp_path, monkeypatch):
 
     # Fake Timer so we don't actually start real timers
     timer_started = []
-    original_timer = worker_mod.threading.Timer
 
     class FakeTimer:
         def __init__(self, interval, function, args=()):
