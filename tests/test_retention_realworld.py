@@ -78,12 +78,12 @@ class TestRetentionConcurrency:
                         token_estimate=10,
                     )
                     n += 1
-                except Exception as e:
+                except BaseException as e:  # SystemError (fd exhaustion under CI ulimit) is a BaseException
                     ingest_errors.append(repr(e))
                     break
             count[0] = n
 
-        t = threading.Thread(target=ingester)
+        t = threading.Thread(target=ingester, daemon=True)
         t.start()
         time.sleep(0.3)
 
@@ -129,7 +129,7 @@ class TestRetentionConcurrency:
             except Exception as e:
                 scan_errors.append(repr(e))
 
-        t = threading.Thread(target=scanner)
+        t = threading.Thread(target=scanner, daemon=True)
         t.start()
         time.sleep(0.1)
 

@@ -270,8 +270,8 @@ class TestRetentionConcurrentTwoPhases:
             except Exception as e:
                 results["errors"].append(("preview", repr(e)))
 
-        t1 = threading.Thread(target=apply)
-        t2 = threading.Thread(target=preview)
+        t1 = threading.Thread(target=apply, daemon=True)
+        t2 = threading.Thread(target=preview, daemon=True)
         t1.start()
         t2.start()
         t1.join(timeout=30)
