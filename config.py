@@ -465,6 +465,8 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("rollup_aggregate_max_tokens", "TROVE_ROLLUP_AGGREGATE_MAX_TOKENS", int),
     _EnvFieldSpec("rollup_builds_per_pass", "TROVE_ROLLUP_BUILDS_PER_PASS", int),
     _EnvFieldSpec("rollup_maintenance_budget_ms", "TROVE_ROLLUP_MAINTENANCE_BUDGET_MS", int),
+    _EnvFieldSpec("retention_days", "TROVE_RETENTION_DAYS", int),
+    _EnvFieldSpec("retention_apply_enabled", "TROVE_RETENTION_APPLY_ENABLED", bool),
 )
 
 _PARSER_BY_TYPE = {
@@ -816,6 +818,20 @@ class TROVEConfig:
     # ingested its first message yet. Set to 0 only in trusted/test
     # environments that intentionally want immediate empty-row pruning.
     empty_lifecycle_gc_max_age_hours: float | None = 24.0
+
+    # -- Session retention ---
+    # Age (in days) after which a stored session's RAW messages become
+    # eligible for retention cleanup. 0 (default) = retain raw messages
+    # forever — TROVE's lossless guarantee is the default and nothing is
+    # ever auto-deleted. When set, a session whose LAST activity is older
+    # than retention_days is a candidate for `/trove doctor retention apply`,
+    # provided it still carries summary nodes (the recallable core). The
+    # actively-bound session is always protected regardless of age.
+    retention_days: int = 0
+    # Destructive `/trove doctor retention apply` workflow. Enabled by default:
+    # the RETENTION_DAYS number is the safety gate (0 = never delete). Set this
+    # to false only to hard-disable apply on shared/multi-user setups.
+    retention_apply_enabled: bool = True
 
     # -- Temporal rollups ---
     # Disabled by default; the engine's ingest/build hooks are flag-gated.

@@ -126,7 +126,16 @@ if [[ -f "$ENV_FILE" ]]; then
     echo "TROVE_ENABLE_SLASH_COMMAND=1" >> "$ENV_FILE"
     echo "Added TROVE_ENABLE_SLASH_COMMAND=1 to $ENV_FILE"
   fi
+  if grep -q "TROVE_RETENTION_DAYS" "$ENV_FILE" 2>/dev/null; then
+    echo "TROVE_RETENTION_DAYS already configured in $ENV_FILE"
+  else
+    echo "TROVE_RETENTION_DAYS=0" >> "$ENV_FILE"
+    echo "Added TROVE_RETENTION_DAYS=0 to $ENV_FILE (0 = keep raw messages forever; set e.g. 90 to auto-delete sessions older than 90 days)"
+  fi
 else
-  echo "TROVE_ENABLE_SLASH_COMMAND=1" > "$ENV_FILE"
-  echo "Created $ENV_FILE with TROVE_ENABLE_SLASH_COMMAND=1"
+  {
+    echo "TROVE_ENABLE_SLASH_COMMAND=1"
+    echo "TROVE_RETENTION_DAYS=0"
+  } > "$ENV_FILE"
+  echo "Created $ENV_FILE with TROVE_ENABLE_SLASH_COMMAND=1 and TROVE_RETENTION_DAYS=0"
 fi

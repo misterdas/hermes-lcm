@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
+import contextlib
 import dataclasses
 import json
 import math
@@ -49,6 +50,7 @@ from .presets import (
     unsupported_runtime_fields_text,
 )
 from .maintenance import backup_database, rotate_backup_database
+from .retention import RetentionPinRefused
 from .assertion_rebuild import rebuild_assertions
 from .assertion_store import AssertionSchemaUnavailableError, AssertionStore
 from . import rollup_builder
@@ -457,6 +459,7 @@ def _help_text(error: str | None = None) -> str:
         "- /trove doctor source: read-only scan for legacy blank-source rows",
         "- /trove doctor source apply: backup-first normalization of legacy blank-source rows to unknown",
         "- /trove doctor retention: read-only retention analysis for stored session footprint and age",
+        "- /trove doctor retention apply: backup-first deletion of stale sessions' RAW messages, keeping summary nodes (TROVE_RETENTION_DAYS is the threshold; set it above 0 to enable. TROVE_RETENTION_APPLY_ENABLED, default true, can hard-disable)",
         "- /trove backup: create a timestamped SQLite backup before any future cleanup workflow",
         "- /trove rotate: preview a tail-preserving in-place compact of the active session (read-only)",
         "- /trove rotate apply: backup-first rotate that advances the lifecycle frontier past pre-tail raw messages",
@@ -667,26 +670,12 @@ def _scan_clean_candidates(engine) -> dict[str, Any]:
 
 def _scan_retention_candidates(engine) -> dict[str, Any]:
     now = datetime.now().timestamp()
-    # SQL is scoped to the foreground session so /trove doctor retention
-    # reports the operator's real conversation rather than whatever side
-    # channel (cron tick, debug probe) currently owns engine._session_id.
-    # The "protected" flag below still keys off engine._session_id (the
-    # actively-bound row) because that is the row receiving live writes
-    # from the concurrent run.
-    session_id = engine.current_session_id
-    if not session_id:
-        return {
-            "error": None,
-            "sessions": [],
-            "sessions_analyzed": 0,
-            "stale_sessions_30d": 0,
-            "stale_sessions_90d": 0,
-            "retained_tokens_30d": 0,
-            "retained_tokens_90d": 0,
-            "protected_count": 0,
-        }
+    # Store-wide scope, matching `retention apply`: the operator must preview
+    # exactly what apply would act on. A foreground-only preview over a
+    # store-wide destructive apply is a trap (previews nothing eligible while
+    # apply deletes other sessions' data).
     try:
-        rows = engine._store.scan_session_retention_stats(session_id)
+        rows = engine._store.scan_session_cleanup_stats_with_age()
     except Exception as exc:  # pragma: no cover - defensive
         return {
             "error": str(exc),
@@ -1833,7 +1822,7 @@ def _doctor_retention_text(engine) -> str:
         )
     if len(sessions) > 20:
         lines.append(f"... {len(sessions) - 20} more session(s) omitted")
-    lines.append("note: retention analysis is scoped to the active session only")
+    lines.append("note: retention analysis is store-wide; `retention apply` uses the same scope")
     lines.append("note: stale sessions are listed before fresh ones; within each bucket, candidates are sorted by footprint (tokens/nodes/messages), with protected current-session entries listed after non-protected ones")
     lines.append("note: read-only analysis only — no rows were deleted")
     lines.append("note: if you prune later, create a safety snapshot first with `/trove backup`")
@@ -1864,107 +1853,379 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
             "lifecycle_skipped": 0,
         }
 
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        SummaryDAG.stage_delete_session_scope(conn, session_ids)
-        scope_table = SummaryDAG.DELETE_SESSION_SCOPE_TABLE
-        # Capture the store_ids about to be deleted so their raw-history chunks
-        # can be archived in this same transaction (chunks map to messages by
-        # store_id; a deleted message's chunks must drop from ranking).
-        deleted_store_ids = [
-            int(row[0])
-            for row in conn.execute(
-                f"SELECT store_id FROM messages WHERE EXISTS ("
+    # Hold the store write lock for this entire transaction.
+    # Prevents concurrent append on shared connection from raising
+    #"cannot start a transaction within a transaction" or committing a half-done delete.
+    store_lock = getattr(engine._store, "_write_lock", None)
+    with store_lock if store_lock is not None else contextlib.suppress():
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            SummaryDAG.stage_delete_session_scope(conn, session_ids)
+            scope_table = SummaryDAG.DELETE_SESSION_SCOPE_TABLE
+            # Capture the store_ids about to be deleted so their raw-history chunks
+            # can be archived in this same transaction (chunks map to messages by
+            # store_id; a deleted message's chunks must drop from ranking).
+            deleted_store_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    f"SELECT store_id FROM messages WHERE EXISTS ("
+                    f"SELECT 1 FROM {scope_table} AS scope "
+                    "WHERE scope.session_id = messages.session_id)"
+                ).fetchall()
+            ]
+            msg_cur = conn.execute(
+                f"DELETE FROM messages WHERE EXISTS ("
                 f"SELECT 1 FROM {scope_table} AS scope "
                 "WHERE scope.session_id = messages.session_id)"
-            ).fetchall()
-        ]
-        msg_cur = conn.execute(
-            f"DELETE FROM messages WHERE EXISTS ("
-            f"SELECT 1 FROM {scope_table} AS scope "
-            "WHERE scope.session_id = messages.session_id)"
-        )
-        archive_chunks = getattr(engine, "_archive_chunks_for_messages", None)
-        if callable(archive_chunks) and deleted_store_ids:
-            archive_chunks(deleted_store_ids, connection=conn)
-        nodes_deleted = 0
-        purge = getattr(engine, "_purge_embeddings_for_nodes", None)
-        while True:
-            deleted_ids = SummaryDAG.delete_node_batch(
-                conn,
-                (),
-                staged_scope=True,
             )
-            if not deleted_ids:
-                break
-            nodes_deleted += len(deleted_ids)
-            if callable(purge):
-                purge(deleted_ids, connection=conn)
+            archive_chunks = getattr(engine, "_archive_chunks_for_messages", None)
+            if callable(archive_chunks) and deleted_store_ids:
+                archive_chunks(deleted_store_ids, connection=conn)
+            nodes_deleted = 0
+            purge = getattr(engine, "_purge_embeddings_for_nodes", None)
+            while True:
+                deleted_ids = SummaryDAG.delete_node_batch(
+                    conn,
+                    (),
+                    staged_scope=True,
+                )
+                if not deleted_ids:
+                    break
+                nodes_deleted += len(deleted_ids)
+                if callable(purge):
+                    purge(deleted_ids, connection=conn)
 
-        lifecycle_scope = "temp_trove_delete_lifecycle_scope"
-        conn.execute(
-            f"CREATE TEMP TABLE IF NOT EXISTS {lifecycle_scope}("
-            "conversation_id TEXT PRIMARY KEY) WITHOUT ROWID"
-        )
-        conn.execute(f"DELETE FROM {lifecycle_scope}")
-        conn.execute(
-            f"INSERT OR IGNORE INTO {lifecycle_scope}(conversation_id) "
-            f"SELECT state.conversation_id FROM {scope_table} AS scope "
-            "JOIN trove_lifecycle_state AS state "
-            "INDEXED BY idx_trove_lifecycle_current_session "
-            "ON state.current_session_id = scope.session_id"
-        )
-        conn.execute(
-            f"INSERT OR IGNORE INTO {lifecycle_scope}(conversation_id) "
-            f"SELECT state.conversation_id FROM {scope_table} AS scope "
-            "JOIN trove_lifecycle_state AS state "
-            "INDEXED BY idx_trove_lifecycle_last_finalized_session "
-            "ON state.last_finalized_session_id = scope.session_id"
-        )
-
-        protected = next(iter(protected_session_ids), "")
-        deletable_where = f"""
-            scoped.conversation_id = state.conversation_id
-            AND (state.current_session_id IS NULL OR state.current_session_id = ''
-                 OR EXISTS (SELECT 1 FROM {scope_table} AS current_scope
-                            WHERE current_scope.session_id = state.current_session_id))
-            AND (state.last_finalized_session_id IS NULL
-                 OR state.last_finalized_session_id = ''
-                 OR EXISTS (SELECT 1 FROM {scope_table} AS finalized_scope
-                            WHERE finalized_scope.session_id = state.last_finalized_session_id))
-            AND (? = '' OR COALESCE(state.current_session_id, '') != ?)
-            AND (? = '' OR COALESCE(state.last_finalized_session_id, '') != ?)
-        """
-        scoped_count = int(
-            conn.execute(f"SELECT COUNT(*) FROM {lifecycle_scope}").fetchone()[0]
-        )
-        lifecycle_deleted = 0
-        while True:
-            rows = conn.execute(
-                f"SELECT state.conversation_id FROM trove_lifecycle_state AS state "
-                f"JOIN {lifecycle_scope} AS scoped ON {deletable_where} "
-                "ORDER BY state.conversation_id LIMIT 256",
-                (protected, protected, protected, protected),
-            ).fetchall()
-            if not rows:
-                break
-            conversation_ids = [str(row[0]) for row in rows]
-            placeholders = ",".join("?" for _ in conversation_ids)
-            cur = conn.execute(
-                f"DELETE FROM trove_lifecycle_state "
-                f"WHERE conversation_id IN ({placeholders})",
-                conversation_ids,
+            lifecycle_scope = "temp_trove_delete_lifecycle_scope"
+            conn.execute(
+                f"CREATE TEMP TABLE IF NOT EXISTS {lifecycle_scope}("
+                "conversation_id TEXT PRIMARY KEY) WITHOUT ROWID"
             )
-            lifecycle_deleted += cur.rowcount if cur.rowcount is not None else 0
-        lifecycle_skipped = scoped_count - lifecycle_deleted
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+            conn.execute(f"DELETE FROM {lifecycle_scope}")
+            conn.execute(
+                f"INSERT OR IGNORE INTO {lifecycle_scope}(conversation_id) "
+                f"SELECT state.conversation_id FROM {scope_table} AS scope "
+                "JOIN trove_lifecycle_state AS state "
+                "INDEXED BY idx_trove_lifecycle_current_session "
+                "ON state.current_session_id = scope.session_id"
+            )
+            conn.execute(
+                f"INSERT OR IGNORE INTO {lifecycle_scope}(conversation_id) "
+                f"SELECT state.conversation_id FROM {scope_table} AS scope "
+                "JOIN trove_lifecycle_state AS state "
+                "INDEXED BY idx_trove_lifecycle_last_finalized_session "
+                "ON state.last_finalized_session_id = scope.session_id"
+            )
+
+            protected = next(iter(protected_session_ids), "")
+            deletable_where = f"""
+                scoped.conversation_id = state.conversation_id
+                AND (state.current_session_id IS NULL OR state.current_session_id = ''
+                     OR EXISTS (SELECT 1 FROM {scope_table} AS current_scope
+                                WHERE current_scope.session_id = state.current_session_id))
+                AND (state.last_finalized_session_id IS NULL
+                     OR state.last_finalized_session_id = ''
+                     OR EXISTS (SELECT 1 FROM {scope_table} AS finalized_scope
+                                WHERE finalized_scope.session_id = state.last_finalized_session_id))
+                AND (? = '' OR COALESCE(state.current_session_id, '') != ?)
+                AND (? = '' OR COALESCE(state.last_finalized_session_id, '') != ?)
+            """
+            scoped_count = int(
+                conn.execute(f"SELECT COUNT(*) FROM {lifecycle_scope}").fetchone()[0]
+            )
+            lifecycle_deleted = 0
+            while True:
+                rows = conn.execute(
+                    f"SELECT state.conversation_id FROM trove_lifecycle_state AS state "
+                    f"JOIN {lifecycle_scope} AS scoped ON {deletable_where} "
+                    "ORDER BY state.conversation_id LIMIT 256",
+                    (protected, protected, protected, protected),
+                ).fetchall()
+                if not rows:
+                    break
+                conversation_ids = [str(row[0]) for row in rows]
+                placeholders = ",".join("?" for _ in conversation_ids)
+                cur = conn.execute(
+                    f"DELETE FROM trove_lifecycle_state "
+                    f"WHERE conversation_id IN ({placeholders})",
+                    conversation_ids,
+                )
+                lifecycle_deleted += cur.rowcount if cur.rowcount is not None else 0
+            lifecycle_skipped = scoped_count - lifecycle_deleted
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     return {
         "messages_deleted": msg_cur.rowcount if msg_cur.rowcount is not None else 0,
         "nodes_deleted": nodes_deleted,
+        "lifecycle_deleted": lifecycle_deleted,
+        "lifecycle_skipped": lifecycle_skipped,
+    }
+
+
+def _doctor_retention_apply_text(engine) -> str:
+    """Backup-first, summary-preserving raw-message cleanup for stale sessions.
+
+    Reuses the atomic coordinated-delete so messages + FTS + chunk archives +
+    lifecycle rows drop in ONE transaction. Summary nodes are intentionally
+    KEPT (that is the whole point: recall survives through the summaries).
+
+    Gates:
+      - retention_apply_enabled (default True) — hard switch, off only on
+        shared setups where apply must be forbidden.
+      - retention_days (default 0) — the threshold. 0 = nothing is stale, so
+        this is a safe no-op ("nothing old enough"), not a rejection. Set it
+        (e.g. 90) to make sessions older than 90 days eligible.
+    """
+    if not getattr(getattr(engine, "_config", None), "retention_apply_enabled", False):
+        return "\n".join([
+            "TROVE doctor retention apply",
+            "status: denied",
+            "error: retention apply is disabled",
+            "note: set TROVE_RETENTION_APPLY_ENABLED=true to enable",
+            "note: no rows were deleted",
+        ])
+
+    scan = _scan_retention_candidates(engine)
+    if scan["error"]:
+        return "\n".join([
+            "TROVE doctor retention apply",
+            "status: error",
+            f"error: {scan['error']}",
+            "note: retention apply aborted before any rows were deleted",
+        ])
+
+    from .retention import evaluate_retention, RetentionPinRefused
+
+    protected = {str(getattr(engine, "_session_id", "") or "")} - {""}
+    # Re-scan ALL sessions for policy evaluation: retention is store-wide,
+    # matching the store-wide read-only preview (`retention apply` scope ==
+    # `doctor retention` scope so the operator previews what would be deleted).
+    try:
+        rows = engine._store.scan_session_cleanup_stats_with_age()
+    except Exception as exc:
+        return "\n".join([
+            "TROVE doctor retention apply",
+            "status: error",
+            f"error: {exc}",
+            "note: retention apply aborted before any rows were deleted",
+        ])
+
+    plan = evaluate_retention(rows, config=engine._config, protected_session_ids=protected)
+    if plan.disabled:
+        return "\n".join([
+            "TROVE doctor retention apply",
+            "status: ok",
+            "eligible_sessions: 0",
+            "note: TROVE_RETENTION_DAYS is 0 (retain raw messages forever); set it to a value above 0 to enable retention cleanup",
+            "note: nothing was deleted",
+        ])
+    if not plan.delete:
+        skip_lines = [f"  - {d.session_id}: {d.reason}" for d in plan.skip[:10]]
+        return "\n".join([
+            "TROVE doctor retention apply",
+            "status: ok",
+            "eligible_sessions: 0",
+            *( [f"skipped_sessions: {len(plan.skip)}"] if plan.skip else [] ),
+            *skip_lines,
+            "note: nothing was deleted",
+        ])
+
+    conn = engine._store.connection
+    backup = backup_database(engine)
+    if not backup["ok"]:
+        return "\n".join([
+            "TROVE doctor retention apply",
+            "status: error",
+            f"database_path: {backup['db_path']}",
+            f"error: backup failed: {backup['error']}",
+            "note: retention apply aborted before any rows were deleted",
+        ])
+
+    session_ids = {d.session_id for d in plan.delete}
+    try:
+        deleted = _delete_retention_candidates_atomically(engine, session_ids)
+    except RetentionPinRefused as exc:
+        return "\n".join([
+            "TROVE doctor retention apply",
+            "status: refused",
+            "error: pinned messages present in eligible sessions",
+            f"detail: {exc}",
+            "note: unpin these messages first; nothing was deleted",
+        ])
+    except sqlite3.Error as exc:
+        return "\n".join([
+            "TROVE doctor retention apply",
+            "status: error",
+            f"database_path: {backup['db_path']}",
+            f"backup_path: {backup['backup_path']}",
+            f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+            f"error: retention apply failed: {exc}",
+            "note: retention apply rolled back; restore from the backup if you need to inspect pre-apply state",
+        ])
+
+    try:
+        freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    except Exception:
+        freelist = None
+    lines = [
+        "TROVE doctor retention apply",
+        "status: ok",
+        f"database_path: {backup['db_path']}",
+        f"backup_path: {backup['backup_path']}",
+        f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+        f"retention_days: {engine._config.retention_days}",
+        f"eligible_sessions: {len(session_ids)}",
+        f"messages_deleted: {deleted['messages_deleted']}",
+        f"summary_nodes_kept: {deleted['nodes_kept']}",
+        f"lifecycle_rows_deleted: {deleted['lifecycle_deleted']}",
+        f"lifecycle_rows_skipped: {deleted['lifecycle_skipped']}",
+        "note: summary nodes were kept — recall continues to work through them",
+        "note: backup created before retention apply",
+    ]
+    if freelist is not None and freelist > 0:
+        lines.append(f"freelist_pages: {freelist}")
+        lines.append("note: freed pages will be reused by future ingests; run VACUUM manually only if you need disk back immediately")
+    if plan.skip:
+        lines.append(f"skipped_sessions: {len(plan.skip)}")
+        for d in plan.skip[:10]:
+            lines.append(f"  - {d.session_id}: {d.reason}")
+    return "\n".join(lines)
+
+
+def _delete_retention_candidates_atomically(engine, session_ids: set[str]) -> dict[str, int]:
+    """Raw-message-only cleanup in one transaction: KEEP summary nodes.
+
+    Differs from ``_delete_clean_candidates_atomically`` (which deletes nodes
+    too): retention deletes messages + FTS rows (via trigger) + chunk archives
+    + eligible lifecycle rows, but leaves every summary node intact so
+    ``trove_recall`` keeps finding the session through its summaries.
+    """
+    conn = engine._store.connection
+    protected_session_ids = {str(s) for s in {getattr(engine, "_session_id", "")} if s}
+    session_ids = {str(s) for s in session_ids if s and str(s) not in protected_session_ids}
+    if not session_ids:
+        return {
+            "messages_deleted": 0,
+            "nodes_kept": 0,
+            "lifecycle_deleted": 0,
+            "lifecycle_skipped": 0,
+        }
+
+    # Hold the store write lock for this entire transaction.
+    # Prevents concurrent append on shared connection from raising
+    #"cannot start a transaction within a transaction" or committing a half-done delete.
+    store_lock = getattr(engine._store, "_write_lock", None)
+    with store_lock if store_lock is not None else contextlib.suppress():
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Pin check INSIDE the transaction: a message pinned after the outer
+            # pre-check ran must still block this delete (TOCTOU guard).
+            pinned_rows = []
+            for sid in sorted(session_ids):
+                count = int(conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ? AND pinned = 1",
+                    (sid,),
+                ).fetchone()[0])
+                if count:
+                    pinned_rows.append((sid, count))
+            if pinned_rows:
+                raise RetentionPinRefused(
+                    "pinned messages present: "
+                    + ", ".join(f"{sid} ({cnt})" for sid, cnt in pinned_rows[:10])
+                )
+            SummaryDAG.stage_delete_session_scope(conn, session_ids)
+            scope_table = SummaryDAG.DELETE_SESSION_SCOPE_TABLE
+            deleted_store_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    f"SELECT store_id FROM messages WHERE EXISTS ("
+                    f"SELECT 1 FROM {scope_table} AS scope "
+                    "WHERE scope.session_id = messages.session_id)"
+                ).fetchall()
+            ]
+            msg_cur = conn.execute(
+                f"DELETE FROM messages WHERE EXISTS ("
+                f"SELECT 1 FROM {scope_table} AS scope "
+                "WHERE scope.session_id = messages.session_id)"
+            )
+            messages_deleted = msg_cur.rowcount if msg_cur.rowcount is not None else 0
+            # FTS rows drop via the msg_fts_delete trigger; chunk archives must be
+            # updated in the same transaction so ranking never sees dead chunks.
+            archive_chunks = getattr(engine, "_archive_chunks_for_messages", None)
+            if callable(archive_chunks) and deleted_store_ids:
+                archive_chunks(deleted_store_ids, connection=conn)
+            nodes_kept = int(conn.execute(
+                f"SELECT COUNT(*) FROM summary_nodes WHERE EXISTS ("
+                f"SELECT 1 FROM {scope_table} AS scope "
+                "WHERE scope.session_id = summary_nodes.session_id)"
+            ).fetchone()[0])
+
+            lifecycle_scope = "temp_trove_delete_lifecycle_scope"
+            conn.execute(
+                f"CREATE TEMP TABLE IF NOT EXISTS {lifecycle_scope}("
+                "conversation_id TEXT PRIMARY KEY) WITHOUT ROWID"
+            )
+            conn.execute(f"DELETE FROM {lifecycle_scope}")
+            conn.execute(
+                f"INSERT OR IGNORE INTO {lifecycle_scope}(conversation_id) "
+                f"SELECT state.conversation_id FROM {scope_table} AS scope "
+                "JOIN trove_lifecycle_state AS state "
+                "INDEXED BY idx_trove_lifecycle_current_session "
+                "ON state.current_session_id = scope.session_id"
+            )
+            conn.execute(
+                f"INSERT OR IGNORE INTO {lifecycle_scope}(conversation_id) "
+                f"SELECT state.conversation_id FROM {scope_table} AS scope "
+                "JOIN trove_lifecycle_state AS state "
+                "INDEXED BY idx_trove_lifecycle_last_finalized_session "
+                "ON state.last_finalized_session_id = scope.session_id"
+            )
+
+            protected = next(iter(protected_session_ids), "")
+            deletable_where = f"""
+                scoped.conversation_id = state.conversation_id
+                AND (state.current_session_id IS NULL OR state.current_session_id = ''
+                     OR EXISTS (SELECT 1 FROM {scope_table} AS current_scope
+                                WHERE current_scope.session_id = state.current_session_id))
+                AND (state.last_finalized_session_id IS NULL
+                     OR state.last_finalized_session_id = ''
+                     OR EXISTS (SELECT 1 FROM {scope_table} AS finalized_scope
+                                WHERE finalized_scope.session_id = state.last_finalized_session_id))
+                AND (? = '' OR COALESCE(state.current_session_id, '') != ?)
+                AND (? = '' OR COALESCE(state.last_finalized_session_id, '') != ?)
+            """
+            scoped_count = int(
+                conn.execute(f"SELECT COUNT(*) FROM {lifecycle_scope}").fetchone()[0]
+            )
+            lifecycle_deleted = 0
+            while True:
+                rows = conn.execute(
+                    f"SELECT state.conversation_id FROM trove_lifecycle_state AS state "
+                    f"JOIN {lifecycle_scope} AS scoped ON {deletable_where} "
+                    "ORDER BY state.conversation_id LIMIT 256",
+                    (protected, protected, protected, protected),
+                ).fetchall()
+                if not rows:
+                    break
+                conversation_ids = [str(row[0]) for row in rows]
+                placeholders = ",".join("?" for _ in conversation_ids)
+                cur = conn.execute(
+                    f"DELETE FROM trove_lifecycle_state "
+                    f"WHERE conversation_id IN ({placeholders})",
+                    conversation_ids,
+                )
+                lifecycle_deleted += cur.rowcount if cur.rowcount is not None else 0
+            lifecycle_skipped = scoped_count - lifecycle_deleted
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    return {
+        "messages_deleted": messages_deleted,
+        "nodes_kept": nodes_kept,
         "lifecycle_deleted": lifecycle_deleted,
         "lifecycle_skipped": lifecycle_skipped,
     }
@@ -5015,6 +5276,8 @@ def handle_trove_command(raw_args: str | None, engine) -> str:
             return _doctor_source_text(engine)
         if len(rest) == 1 and rest[0].lower() == "retention":
             return _doctor_retention_text(engine)
+        if len(rest) == 2 and rest[0].lower() == "retention" and rest[1].lower() == "apply":
+            return _doctor_retention_apply_text(engine)
         if len(rest) == 2 and rest[0].lower() == "clean" and rest[1].lower() == "apply":
             return _doctor_clean_apply_text(engine)
         if len(rest) == 2 and rest[0].lower() == "clean" and rest[1].lower() == "lifecycle":
@@ -5034,7 +5297,7 @@ def handle_trove_command(raw_args: str | None, engine) -> str:
             return _doctor_repair_schema_stamp_apply_text(engine)
         if len(rest) == 2 and rest[0].lower() == "source" and rest[1].lower() == "apply":
             return _doctor_source_apply_text(engine)
-        return _help_text("`/trove doctor` currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, and `retention` as extra subcommands.")
+        return _help_text("`/trove doctor` currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, `retention`, and `retention apply` as extra subcommands.")
 
     if head == "backup":
         if rest:
