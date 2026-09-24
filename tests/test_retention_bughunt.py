@@ -2,12 +2,10 @@
 import sys
 import os
 import time
-import threading
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import pytest
 
 from hermes_trove.config import TROVEConfig
 from hermes_trove.engine import TROVEEngine
@@ -76,7 +74,7 @@ class TestRetentionAgeCalculation:
             source_token_count=500, source_ids=[], source_type="messages",
             created_at=time.time(), earliest_at=old_ts, latest_at=time.time()
         ))
-        result = handle_trove_command("doctor retention apply", engine)
+        handle_trove_command("doctor retention apply", engine)
         # The node is recent, so age = max(old, recent) = recent → NOT eligible
         assert engine._store._conn.execute("SELECT COUNT(*) FROM messages WHERE session_id='mixed-session'").fetchone()[0] == 5
 
@@ -93,7 +91,7 @@ class TestRetentionAgeCalculation:
             source_token_count=500, source_ids=[], source_type="messages",
             created_at=old_ts, earliest_at=old_ts, latest_at=old_ts
         ))
-        result = handle_trove_command("doctor retention apply", engine)
+        handle_trove_command("doctor retention apply", engine)
         # Recent messages → age = max(recent, old) = recent → NOT eligible
         assert engine._store._conn.execute("SELECT COUNT(*) FROM messages WHERE session_id='mixed-session2'").fetchone()[0] == 5
 

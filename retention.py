@@ -70,7 +70,6 @@ def evaluate_retention(
         return plan
 
     current_time = float(now) if now is not None else datetime.now().timestamp()
-    cutoff_seconds = retention_days * 86400.0
 
     for row in rows:
         (

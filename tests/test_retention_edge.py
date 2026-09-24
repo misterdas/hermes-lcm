@@ -7,7 +7,6 @@ import threading
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import pytest
 
 from hermes_trove.config import TROVEConfig
 from hermes_trove.engine import TROVEEngine
@@ -152,7 +151,7 @@ class TestRetentionDuplicateSessionIds:
         result = handle_trove_command("doctor retention", engine)
         # Count sessions reported - they're formatted as '- session_id | ...'
         lines = result.split('\n')
-        session_lines = [l for l in lines if l.startswith("- ") and "session-" in l]
+        session_lines = [line for line in lines if line.startswith("- ") and "session-" in line]
         # Should have exactly 3 unique sessions
         assert len(session_lines) == 3
 

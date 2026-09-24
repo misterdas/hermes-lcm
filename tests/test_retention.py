@@ -2,13 +2,12 @@
 
 import time
 
-import pytest
 
 from hermes_trove.command import handle_trove_command
 from hermes_trove.config import TROVEConfig
 from hermes_trove.dag import SummaryNode
 from hermes_trove.engine import TROVEEngine
-from hermes_trove.retention import RetentionDecision, evaluate_retention
+from hermes_trove.retention import evaluate_retention
 
 
 def _make_engine(tmp_path, **config_overrides):
@@ -35,7 +34,7 @@ def _add_old_session(engine, session_id, *, messages=3, node=True, pinned=False)
             engine._store.pin(sid)
         store_ids.append(sid)
     engine._store._conn.execute(
-        f"UPDATE messages SET timestamp = ? WHERE session_id = ?", (old_ts, session_id)
+        "UPDATE messages SET timestamp = ? WHERE session_id = ?", (old_ts, session_id)
     )
     engine._store._conn.commit()
     if node:

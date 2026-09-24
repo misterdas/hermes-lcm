@@ -7,7 +7,6 @@ import threading
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import pytest
 
 from hermes_trove.config import TROVEConfig
 from hermes_trove.engine import TROVEEngine
@@ -148,7 +147,6 @@ class TestRetentionMixedAge:
         """Only sessions older than retention_days are deleted."""
         engine = make_engine(tmp_path, retention_days=90)
 
-        old_ts = time.time() - 200 * 86400
         young_ts = time.time() - 30 * 86400
 
         # Add 3 old sessions, 3 young sessions
@@ -205,7 +203,6 @@ class TestRetentionMixedAge:
         engine = make_engine(tmp_path, retention_days=90)
 
         # Session at exactly 90 days - should be eligible
-        boundary_ts = time.time() - 90 * 86400
         add_old_session(engine, "boundary-90", message_count=5, age_days=90)
 
         result = handle_trove_command("doctor retention apply", engine)
@@ -245,8 +242,11 @@ class TestRetentionMixedAge:
             "SELECT COUNT(*) FROM messages WHERE session_id='boundary-89'"
         ).fetchone()[0]
 
-        # boundary-90 might or might not be deleted (depends on exact second boundary)
-        # boundary-89 must NOT be deleted
+        # boundary-90 is always at least 90 days old by the time apply
+        # evaluates it (a few microseconds elapse between setup and the
+        # policy pass), so it is deterministically eligible; boundary-89
+        # must NOT be deleted.
+        assert rm_90 == 0, f"boundary-90 should be deleted, got {rm_90}"
         assert rm_89 == 1, f"boundary-89 should be kept, got {rm_89}"
 
 
@@ -262,6 +262,7 @@ class TestRetentionNewSessionCarryOver:
 
         # Simulate /new - the old session should still be eligible
         result = handle_trove_command("doctor retention apply", engine)
+        assert "status: ok" in result
 
         rm = engine._store._conn.execute(
             "SELECT COUNT(*) FROM messages WHERE session_id='prev-conv'"
@@ -292,6 +293,7 @@ class TestRetentionEdgeCases:
 
         # No summary node added - this session was never compacted
         result = handle_trove_command("doctor retention apply", engine)
+        assert "status: ok" in result
         rm = engine._store._conn.execute(
             "SELECT COUNT(*) FROM messages WHERE session_id='never-compacted'"
         ).fetchone()[0]
@@ -352,6 +354,7 @@ class TestRetentionEdgeCases:
         )
 
         result = handle_trove_command("doctor retention apply", engine)
+        assert "status: ok" in result
         rm = engine._store._conn.execute(
             "SELECT COUNT(*) FROM messages WHERE session_id='live-session'"
         ).fetchone()[0]
