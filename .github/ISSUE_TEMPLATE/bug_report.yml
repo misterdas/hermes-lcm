@@ -44,7 +44,7 @@ body:
     attributes:
       label: Version and branch
       description: hermes-trove version, branch, commit, or release tag.
-      placeholder: v1.1.4, main, or commit SHA
+      placeholder: v1.2.0, main, or commit SHA
     validations:
       required: true
 

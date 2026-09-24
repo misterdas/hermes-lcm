@@ -2,6 +2,29 @@
 
 This repo also publishes GitHub Releases. This file is the repo-root release surface for operators who want the recent release arc without leaving the checkout.
 
+## v1.2.0 - 2026-09-24
+
+### Added
+
+- **Session retention** (`retention.py`, `/trove doctor retention` + `retention apply`): opt-in cleanup of stale sessions' RAW messages while keeping summary nodes, so recall survives through the summaries.
+  - `TROVE_RETENTION_DAYS` is the safety threshold (0 = retain forever, the default); `TROVE_RETENTION_APPLY_ENABLED` (default true) is the hard switch for shared setups.
+  - Backup-first, one-transaction atomic delete: messages + FTS (via trigger) + chunk archives + eligible lifecycle rows; pinned messages refuse the whole apply; the live session is always protected.
+  - `install.sh` now writes `TROVE_RETENTION_DAYS=0` to `.env` alongside the slash-command line.
+
+### Fixed
+
+- **Concurrency**: both coordinated-delete paths (`_delete_clean_candidates_atomically`, `_delete_retention_candidates_atomically`) now hold `store._write_lock` around their `BEGIN IMMEDIATE` transaction. Without this, a concurrent `append()` on the shared connection could raise "cannot start a transaction within a transaction" or commit a half-done delete.
+- **Retention preview/apply scope**: preview is now store-wide, matching the destructive apply exactly.
+- **Pin-check TOCTOU**: pinned-message check runs inside the delete transaction; a pin landing after the pre-check still blocks the whole apply.
+- **Installer config.yaml merge** (maintainer note): the standalone installer previously appended a duplicate top-level `plugins:`/`context:` block — invalid YAML that silently drops existing plugins. Now a YAML-aware in-place merge (with safe manual-instructions fallback when PyYAML is unavailable).
+
+### Changed
+
+- **Hook registration** (maintainer note): `post_llm_call` now registers via the public `ctx.register_hook()` API (declared in `provides_hooks`) instead of appending to the private `PluginManager._hooks` list; legacy hosts fall back to the old path.
+- **Skill hygiene** (maintainer note): the maintainer release procedure moved from the model-facing `SKILL.md` to `references/release.md`.
+
+- Full suite green: 122 retention tests + complete engine/command suites pass across Python 3.11–3.14.
+
 ## v1.0.0 - 2026-09-21
 
 ### Added

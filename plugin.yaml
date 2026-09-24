@@ -1,5 +1,5 @@
 name: hermes-trove
-version: 1.1.4
+version: 1.2.0
 description: Lossless Context Management — standalone Hermes plugin with a DAG-based context engine that never loses a message
 author: Voltropy / Hermes Community
 provides_tools:
@@ -20,5 +20,6 @@ provides_tools:
   - trove_doctor
 provides_hooks:
   - pre_llm_call
+  - post_llm_call
   - subagent_start
   - subagent_stop

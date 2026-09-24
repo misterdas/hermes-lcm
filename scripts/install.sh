@@ -85,26 +85,44 @@ Verification:
   4. Confirm the available skills include hermes-trove.
 EOF
 
-# Auto-configure config.yaml if needed
+# Auto-configure config.yaml if needed. Use a YAML-aware merge so we never
+# append a duplicate top-level `plugins:` / `context:` block (duplicate keys
+# are invalid YAML — PyYAML silently drops the earlier one, which can wipe
+# out the user's existing plugin list).
 CONFIG="$TARGET_ROOT/config.yaml"
 if [[ -f "$CONFIG" ]]; then
-  needs_update=false
-
   if ! grep -q "hermes-trove" "$CONFIG" 2>/dev/null; then
-    needs_update=true
-  fi
-
-  if [[ "$needs_update" == "true" ]]; then
-    cat >> "$CONFIG" <<YAML
-
-plugins:
-  enabled:
-    - hermes-trove
-
-context:
-  engine: trove
-YAML
-    echo "Auto-configured $CONFIG"
+    if python3 - "$CONFIG" <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+try:
+    import yaml
+except ImportError:
+    sys.exit(2)          # no PyYAML -> caller falls back to manual block
+data = yaml.safe_load(p.read_text()) or {}
+if not isinstance(data, dict):
+    sys.exit(1)          # unexpected top-level type -> caller aborts
+plugins = data.setdefault("plugins", {})
+enabled = plugins.setdefault("enabled", [])
+if "hermes-trove" not in enabled:
+    enabled.append("hermes-trove")
+context = data.setdefault("context", {})
+context.setdefault("engine", "trove")
+tmp = p.with_suffix(".yaml.trovetmp")
+tmp.write_text(yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
+tmp.replace(p)
+PY
+    then
+      echo "Auto-configured $CONFIG"
+    else
+      # PyYAML missing, or unexpected config shape: never blind-append, tell the user.
+      echo "Could not auto-merge $CONFIG — add manually:"
+      echo "  plugins:"
+      echo "    enabled:"
+      echo "      - hermes-trove"
+      echo "  context:"
+      echo "    engine: trove"
+    fi
   else
     echo "config.yaml already has hermes-trove activation"
   fi
