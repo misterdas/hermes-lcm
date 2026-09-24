@@ -456,6 +456,8 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("embedding_query_spend_max_calls", "TROVE_EMBEDDING_QUERY_SPEND_MAX_CALLS", int),
     _EnvFieldSpec("embedding_query_spend_window_seconds", "TROVE_EMBEDDING_QUERY_SPEND_WINDOW_SECONDS", float),
     _EnvFieldSpec("embedding_query_spend_backoff_seconds", "TROVE_EMBEDDING_QUERY_SPEND_BACKOFF_SECONDS", float),
+    _EnvFieldSpec("embed_auto_backfill_enabled", "TROVE_EMBED_AUTO_BACKFILL", bool),
+    _EnvFieldSpec("embed_auto_backfill_debounce_s", "TROVE_EMBED_AUTO_BACKFILL_DEBOUNCE_S", float),
     _EnvFieldSpec("new_session_retain_depth", "TROVE_NEW_SESSION_RETAIN_DEPTH", int),
     _EnvFieldSpec("doctor_clean_apply_enabled", "TROVE_DOCTOR_CLEAN_APPLY_ENABLED", bool),
     _EnvFieldSpec("slash_commands_enabled", "TROVE_ENABLE_SLASH_COMMAND", bool),
@@ -805,6 +807,16 @@ class TROVEConfig:
     embedding_query_spend_max_calls: int = 600
     embedding_query_spend_window_seconds: float = 60.0
     embedding_query_spend_backoff_seconds: float = 60.0
+
+    # -- Auto-embedding background worker (F1) ---
+    # Embeddings backfill automatically on a debounce after ingests.
+    # The worker runs one bounded batch of pending embeddings on a daemon
+    # thread, reusing the existing lease/inflight/publish machinery.
+    # Disabled by setting TROVE_EMBED_AUTO_BACKFILL=0.
+    embed_auto_backfill_enabled: bool = True
+    # Debounce window in seconds. A burst of ingests coalesces into a
+    # single background run. Default 30.0; set <= 0 to force 30.0.
+    embed_auto_backfill_debounce_s: float = 30.0
 
     # -- Session carry-over ---
     # Depth retained after /new (-1 = all, 0 = nothing, 2 = keep d2+)

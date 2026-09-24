@@ -603,20 +603,32 @@ def register(ctx):
                 conversation_id=conversation_id,
             ) or engine
 
+        resolved_engine = active_engine
         try:
             # Session identity is authoritative for rebinding. Older hosts
             # can deliver stale lane metadata alongside the correct active
             # session id; rebinding a clone on conversation_id mismatch
             # alone would move it away from the runtime it is serving.
             _ensure_engine_bound_to_session(
-                active_engine,
+                resolved_engine,
                 session_id,
                 platform=platform,
                 conversation_id=conversation_id,
             )
-            active_engine.ingest(history)
+            resolved_engine.ingest(history)
         except Exception as exc:
             logger.debug("TROVE post_llm_call ingest error: %s", exc)
+
+        # Schedule a debounced auto-backfill run so newly ingested
+        # messages become semantically searchable without an operator
+        # running `/trove embed backfill` manually. The scheduler is a
+        # no-op when embeddings are disabled or the feature is disabled.
+        try:
+            from .embed_worker import schedule_auto_backfill
+
+            schedule_auto_backfill(resolved_engine)
+        except Exception as exc:
+            logger.debug("TROVE auto-backfill scheduling error: %s", exc)
 
     _register_post_hook = getattr(ctx, "register_hook", None)
     try:

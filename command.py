@@ -70,6 +70,7 @@ from .embedding_provider import (
     FastembedProvider,
     ProviderPreDispatchError,
     VoyageError,
+    _DEFAULT_FASTEMBED_CACHE,
     _VOYAGE_CONTEXT_DOCUMENT_TOKEN_BUDGET,
     _VOYAGE_CONTEXT_MAX_CHUNK_TOKENS,
     _VOYAGE_CONTEXT_MAX_REQUEST_CHUNKS,
@@ -472,6 +473,7 @@ def _help_text(error: str | None = None) -> str:
         "- /trove preset apply <name> --dry-run: preview env-var changes without mutating live config",
         "- /trove embed warmup: download/probe the configured embedding model and register its dimension",
         "- /trove embed backfill [--apply] [--limit N]: preview or populate missing leaf-summary embeddings",
+        "- /trove embed status: show whether embeddings are enabled, the active profile, lease state, and vector coverage (read-only)",
         "- /trove help: show this help",
     ])
     return "\n".join(lines)
@@ -2993,6 +2995,210 @@ def _resolve_store_dim(config, provider_dim: int, override: int | None = None) -
     return store_dim
 
 
+def _count_inflight(conn: sqlite3.Connection) -> int:
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM trove_embedding_backfill_inflight"
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return 0
+        raise
+
+
+def _count_vectors(
+    conn: sqlite3.Connection, table: str, identity_hash: str | None
+) -> int:
+    try:
+        if identity_hash:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE identity_hash = ?",
+                (identity_hash,),
+            ).fetchone()
+        else:
+            row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        return int(row[0]) if row is not None else 0
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return 0
+        raise
+
+
+def _max_embedded_at(conn: sqlite3.Connection) -> str | None:
+    """Latest embedded_at across both corpora, or None if no meta tables."""
+    latest: str | None = None
+    for table in ("trove_embedding_meta", "trove_chunk_meta"):
+        try:
+            row = conn.execute(
+                f"SELECT MAX(embedded_at) FROM {table}"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                continue
+            raise
+        if row and row[0] is not None:
+            if latest is None or str(row[0]) > latest:
+                latest = str(row[0])
+    return latest
+
+
+def _embedding_status_text(engine) -> str:
+    """Read-only summary of embedding/backfill state for the operator."""
+    enabled = bool(getattr(engine._config, "embeddings_enabled", False))
+    configured_provider = str(
+        getattr(engine._config, "embedding_provider", "") or ""
+    ).strip().lower()
+    configured_model = str(
+        getattr(engine._config, "embedding_model", "") or ""
+    ).strip()
+    configured_dtype = str(
+        getattr(engine._config, "embedding_storage_dtype", "") or "float32"
+    ).strip()
+    configured_dim = int(getattr(engine._config, "embedding_store_dim", 0) or 0)
+    cache_dir = (
+        str(getattr(engine._config, "fastembed_cache_dir", "") or "").strip()
+        or str(_DEFAULT_FASTEMBED_CACHE)
+    )
+
+    lines = [
+        "TROVE embedding status",
+        f"embeddings_enabled: {enabled}",
+        f"configured_provider: {configured_provider or '(unset)'}",
+        f"configured_model: {configured_model or '(unset)'}",
+        f"configured_dtype: {configured_dtype or 'float32'}",
+        f"configured_dim: {configured_dim or '(unset)'}",
+        f"fastembed_cache_dir: {cache_dir}",
+    ]
+
+    db_path = engine._store.db_path
+    if not Path(db_path).exists():
+        lines.append("status: error")
+        lines.append(
+            f"error: embedding database is unavailable "
+            f"(unable to open database file: {db_path}); "
+            "run `/trove embed warmup` first"
+        )
+        return "\n".join(lines)
+
+    try:
+        read_conn = _embedding_read_connection(db_path)
+    except sqlite3.Error as exc:
+        lines.append("status: error")
+        lines.append(
+            f"error: embedding database is unavailable ({exc}); "
+            "run `/trove embed warmup` first"
+        )
+        return "\n".join(lines)
+
+    try:
+        summary_profile = _embedding_current_profile(read_conn)
+        chunk_profile = _chunk_current_profile(read_conn)
+
+        if summary_profile is not None:
+            lines.append(
+                f"summary_profile: {summary_profile['provider']}/"
+                f"{summary_profile['model_name']} "
+                f"dim={summary_profile['dim']} "
+                f"dtype={summary_profile['dtype'] or 'float32'}"
+            )
+        else:
+            lines.append("summary_profile: (none registered)")
+
+        if chunk_profile is not None:
+            lines.append(
+                f"chunk_profile: {chunk_profile['provider']}/"
+                f"{chunk_profile['model_name']} "
+                f"dim={chunk_profile['dim']} "
+                f"dtype={chunk_profile['dtype'] or 'float32'}"
+            )
+        else:
+            lines.append("chunk_profile: (none registered)")
+
+        ttl_s = _embedding_backfill_lease_ttl_s()
+        try:
+            claim_row = read_conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (_EMBEDDING_BACKFILL_CLAIM_KEY,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            claim_row = None
+
+        if claim_row is None:
+            lines.append("backfill_lease: none")
+        else:
+            payload = json.loads(str(claim_row[0]))
+            if not isinstance(payload, dict):
+                payload = {}
+            holder = str(payload.get("owner", "(unknown)"))
+            generation = int(payload.get("generation", 0) or 0)
+            heartbeat_at = float(
+                payload.get("heartbeat_at", payload.get("claimed_at", 0.0))
+                or 0.0
+            )
+            remaining = ttl_s - (time.time() - heartbeat_at)
+            if remaining > 0:
+                lines.append(
+                    f"backfill_lease: held by {holder} "
+                    f"(generation {generation}, "
+                    f"{remaining:.1f}s of {ttl_s:.0f}s TTL remaining)"
+                )
+            else:
+                lines.append(
+                    f"backfill_lease: expired (last holder {holder}, "
+                    f"generation {generation}, "
+                    f"expired {-remaining:.1f}s ago)"
+                )
+
+        in_flight = _count_inflight(read_conn)
+        lines.append(f"in_flight: {in_flight}")
+
+        if summary_profile is not None:
+            summary_identity = str(summary_profile["identity_hash"])
+            vectors = _count_vectors(
+                read_conn, "trove_embedding_vectors", summary_identity
+            )
+            pending, _ = _embedding_pending_rows(read_conn, summary_identity, 1)
+            lines.append(f"summary_vectors: {vectors}")
+            lines.append(f"summary_pending: {pending}")
+        else:
+            lines.append("summary_vectors: (no profile)")
+            lines.append("summary_pending: (no profile)")
+
+        if chunk_profile is not None:
+            chunk_identity = str(chunk_profile["identity_hash"])
+            chunk_vectors = _count_vectors(
+                read_conn, "trove_chunk_vectors", chunk_identity
+            )
+            lines.append(f"chunk_vectors: {chunk_vectors}")
+        else:
+            chunk_identity = None
+            lines.append("chunk_vectors: (no profile)")
+
+        policy = normalize_content_policy(
+            getattr(engine._config, "embedding_content_policy", "conversational")
+        )
+        try:
+            chunk_pending, _, _ = _chunk_pending_rows(
+                read_conn, chunk_identity, policy, 1
+            )
+        except sqlite3.OperationalError:
+            chunk_pending = 0
+        lines.append(f"chunk_pending: {chunk_pending}")
+
+        last_at = _max_embedded_at(read_conn)
+        lines.append(f"last_backfill_at: {last_at or 'unknown'}")
+
+        lines.append("status: ok")
+    except sqlite3.Error as exc:
+        lines.append("status: error")
+        lines.append(f"error: could not read embedding state ({exc})")
+    finally:
+        read_conn.close()
+
+    return "\n".join(lines)
+
+
 def _embedding_warmup_text(engine) -> str:
     """Warm and dimension-lock both summary and chunk vector profiles."""
     try:
@@ -5360,9 +5566,11 @@ def handle_trove_command(raw_args: str | None, engine) -> str:
     if head == "embed":
         if len(rest) == 1 and rest[0].lower() == "warmup":
             return _embedding_warmup_text(engine)
+        if len(rest) == 1 and rest[0].lower() == "status":
+            return _embedding_status_text(engine)
         if rest and rest[0].lower() == "backfill":
             return _embedding_backfill_text(rest[1:], engine)
-        return _help_text("`/trove embed` requires the `warmup` or `backfill` subcommand.")
+        return _help_text("`/trove embed` requires the `warmup`, `status`, or `backfill` subcommand.")
 
     if head == "help":
         return _help_text()
