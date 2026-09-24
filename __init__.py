@@ -572,52 +572,60 @@ def register(ctx):
     # receives conversation_history including the assistant response.  The
     # existing _ingest_messages cursor prevents duplicates if compress() runs
     # later the same turn.
-    try:
-        from hermes_cli.plugins import get_plugin_manager as _get_pm
-        _mgr = _get_pm()
+    #
+    # Prefer the public register_hook API (callback is tracked and removed on
+    # plugin unload; the name is validated against the host's hook bus).
+    # Older hosts that don't expose register_hook still get the per-turn
+    # ingest through the manager's hook bus directly.
+    def _on_post_llm_call(**kwargs):
+        history = kwargs.get("conversation_history")
+        if not history:
+            return
+        active_engine = kwargs.get("context_compressor")
+        if not (
+            active_engine is not None
+            and getattr(active_engine, "name", None) == "trove"
+            and hasattr(active_engine, "ingest")
+        ):
+            active_engine = None
 
-        def _on_post_llm_call(**kwargs):
-            history = kwargs.get("conversation_history")
-            if not history:
-                return
-            active_engine = kwargs.get("context_compressor")
-            if not (
-                active_engine is not None
-                and getattr(active_engine, "name", None) == "trove"
-                and hasattr(active_engine, "ingest")
-            ):
-                active_engine = None
+        session_id = str(kwargs.get("session_id") or "")
+        conversation_id = str(
+            kwargs.get("conversation_id")
+            or kwargs.get("gateway_session_key")
+            or ""
+        )
+        platform = str(kwargs.get("platform") or "")
 
-            session_id = str(kwargs.get("session_id") or "")
-            conversation_id = str(
-                kwargs.get("conversation_id")
-                or kwargs.get("gateway_session_key")
-                or ""
+        if active_engine is None:
+            active_engine = resolve_active_trove_engine(
+                session_id=session_id,
+                conversation_id=conversation_id,
+            ) or engine
+
+        try:
+            # Session identity is authoritative for rebinding. Older hosts
+            # can deliver stale lane metadata alongside the correct active
+            # session id; rebinding a clone on conversation_id mismatch
+            # alone would move it away from the runtime it is serving.
+            _ensure_engine_bound_to_session(
+                active_engine,
+                session_id,
+                platform=platform,
+                conversation_id=conversation_id,
             )
-            platform = str(kwargs.get("platform") or "")
+            active_engine.ingest(history)
+        except Exception as exc:
+            logger.debug("TROVE post_llm_call ingest error: %s", exc)
 
-            if active_engine is None:
-                active_engine = resolve_active_trove_engine(
-                    session_id=session_id,
-                    conversation_id=conversation_id,
-                ) or engine
-
-            try:
-                # Session identity is authoritative for rebinding. Older hosts
-                # can deliver stale lane metadata alongside the correct active
-                # session id; rebinding a clone on conversation_id mismatch
-                # alone would move it away from the runtime it is serving.
-                _ensure_engine_bound_to_session(
-                    active_engine,
-                    session_id,
-                    platform=platform,
-                    conversation_id=conversation_id,
-                )
-                active_engine.ingest(history)
-            except Exception as exc:
-                logger.debug("TROVE post_llm_call ingest error: %s", exc)
-
-        _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
+    _register_post_hook = getattr(ctx, "register_hook", None)
+    try:
+        if callable(_register_post_hook):
+            _register_post_hook("post_llm_call", _on_post_llm_call)
+        else:
+            from hermes_cli.plugins import get_plugin_manager as _get_pm
+            _mgr = _get_pm()
+            _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
         logger.debug("TROVE registered post_llm_call hook for per-turn ingest")
     except Exception as exc:
         logger.debug("TROVE could not register post_llm_call hook: %s", exc)
