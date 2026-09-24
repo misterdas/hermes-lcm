@@ -574,6 +574,7 @@ def test_embedding_config_defaults_and_environment(monkeypatch):
     assert defaults.embedding_query_timeout_s == 3.0
     assert defaults.embedding_backfill_timeout_s == 120.0
     assert defaults.embedding_max_batch_items == 1000
+    assert defaults.fastembed_cache_dir == ""
 
     monkeypatch.setenv("TROVE_EMBEDDING_PROVIDER", "ollama")
     monkeypatch.setenv("TROVE_EMBEDDING_MODEL", "model-a")
@@ -581,6 +582,7 @@ def test_embedding_config_defaults_and_environment(monkeypatch):
     monkeypatch.setenv("TROVE_EMBEDDING_QUERY_TIMEOUT_S", "4.5")
     monkeypatch.setenv("TROVE_EMBEDDING_BACKFILL_TIMEOUT_S", "45.0")
     monkeypatch.setenv("TROVE_EMBEDDING_MAX_BATCH_ITEMS", "500")
+    monkeypatch.setenv("TROVE_FASTEMBED_CACHE_DIR", "/shared/fastembed")
     configured = TROVEConfig.from_env()
     assert configured.embedding_provider == "ollama"
     assert configured.embedding_model == "model-a"
@@ -588,6 +590,7 @@ def test_embedding_config_defaults_and_environment(monkeypatch):
     assert configured.embedding_query_timeout_s == 4.5
     assert configured.embedding_backfill_timeout_s == 45.0
     assert configured.embedding_max_batch_items == 500
+    assert configured.fastembed_cache_dir == "/shared/fastembed"
 
 
 class FakeWarmupProvider:

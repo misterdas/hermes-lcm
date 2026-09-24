@@ -447,6 +447,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("embedding_model", "TROVE_EMBEDDING_MODEL", str),
     _EnvFieldSpec("embedding_content_policy", "TROVE_EMBED_CONTENT_POLICY", str),
     _EnvFieldSpec("ollama_base_url", "TROVE_OLLAMA_BASE_URL", str),
+    _EnvFieldSpec("fastembed_cache_dir", "TROVE_FASTEMBED_CACHE_DIR", str),
     _EnvFieldSpec("embedding_query_timeout_s", "TROVE_EMBEDDING_QUERY_TIMEOUT_S", float),
     _EnvFieldSpec("recall_query_timeout_s", "TROVE_RECALL_QUERY_TIMEOUT_S", float),
     _EnvFieldSpec("embedding_backfill_timeout_s", "TROVE_EMBEDDING_BACKFILL_TIMEOUT_S", float),
@@ -768,6 +769,11 @@ class TROVEConfig:
     # default in the chunker's normalize_content_policy.
     embedding_content_policy: str = "conversational"
     ollama_base_url: str = "http://localhost:11434"
+    # fastembed model cache dir (opt-in, default-off). Empty = fall back to
+    # the process-level default (~/.cache/fastembed). Set this to a shared
+    # cache dir so multiple local-model users share ONE model download
+    # instead of each keeping their own copy.
+    fastembed_cache_dir: str = ""
     embedding_query_timeout_s: float = 3.0
     # Dedicated deadline for trove_recall. It fans out three sequential arms (FTS +
     # summary KNN + chunk KNN) plus fusion, hydration, and an optional rerank, so

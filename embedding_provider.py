@@ -1745,8 +1745,9 @@ def resolve_provider(
             spend_guard=spend_guard,
         )
     if provider in {"fastembed", "fast-embed"}:
+        cache_dir = getattr(config, "fastembed_cache_dir", "") or None
         return FastembedProvider(
-            model, timeout=timeout, spend_guard=spend_guard
+            model, timeout=timeout, spend_guard=spend_guard, cache_dir=cache_dir
         )
     raise ProviderUnavailable(
         f"Unsupported embedding provider {provider!r}; use voyage, ollama, or fastembed"
