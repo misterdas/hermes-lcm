@@ -17,6 +17,7 @@ from hermes_trove.externalize import (
     externalized_tool_result_has_persisted_output_marker,
     reassign_externalized_payloads,
 )
+from hermes_trove.ingest_protection import _refs_for_externalized_integrity_scan
 
 
 class _Config:
@@ -29,6 +30,82 @@ def payload_store(tmp_path: Path) -> tuple[Path, _Config]:
     storage_dir = tmp_path / "externalized"
     storage_dir.mkdir(mode=0o700)
     return storage_dir, _Config(storage_dir)
+
+
+def test_json_encoded_externalized_placeholder_text_is_not_a_real_ref():
+    text = '{"output": "[GC\'d externalized tool output: tool_call_id=call; ref=payload.json]"}'
+    assert _refs_for_externalized_integrity_scan(text, role="tool", field="content") == []
+    assert _refs_for_externalized_integrity_scan(
+        "[GC'd externalized tool output: tool_call_id=call; ref=payload.json]",
+        role="tool",
+        field="content",
+    ) == ["payload.json"]
+
+
+def test_json_embedded_legacy_marker_in_tool_call_arguments_is_not_a_live_ref():
+    """A patch/test/doc payload quoting the legacy marker is not a live ref.
+
+    Regresses a real doctor false positive: this repo's own patch tool calls
+    carried the legacy marker inside new_string, escaped three levels deep in
+    tool_calls JSON, and doctor reported a missing payload file for it.
+    """
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "patch",
+                    "arguments": json.dumps(
+                        {
+                            "new_string": (
+                                "def test_thing():\n"
+                                "    text = '{\"output\": \"[GC\\'d externalized tool output: "
+                                "tool_call_id=call; ref=payload.json]\"}'\n"
+                            )
+                        }
+                    ),
+                }
+            }
+        ]
+    )
+    assert _refs_for_externalized_integrity_scan(tool_calls, role="assistant", field="tool_calls") == []
+
+
+def test_whole_value_legacy_marker_in_tool_call_argument_is_still_a_live_ref():
+    """Boundary placement must keep working; only embedded markers are dropped."""
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "read_output",
+                    "arguments": json.dumps(
+                        {
+                            "output": "[GC'd externalized tool output: tool_call_id=call; ref=payload.json]"
+                        }
+                    ),
+                }
+            }
+        ]
+    )
+    assert _refs_for_externalized_integrity_scan(
+        tool_calls, role="assistant", field="tool_calls"
+    ) == ["payload.json"]
+
+
+def test_ingest_placeholder_mid_value_is_still_a_live_ref():
+    """Ingest markers have field= provenance, so mid-value placement is trusted."""
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "analyze_image",
+                    "arguments": json.dumps({"image": "caption says hi [Externalized TROVE ingest payload: kind=media_payload; field=tool_calls; chars=1; bytes=1; ref=real-media.json]"}),
+                }
+            }
+        ]
+    )
+    assert _refs_for_externalized_integrity_scan(
+        tool_calls, role="assistant", field="tool_calls"
+    ) == ["real-media.json"]
 
 
 def _payload(*, session_id: str = "old-session", content: str = "stored output") -> dict:

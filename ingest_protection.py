@@ -1659,6 +1659,17 @@ def _looks_like_example_payload_ref(ref: str) -> bool:
     return name.startswith(("example-", "example_", "fake-", "fake_", "dummy-", "dummy_", "placeholder-", "placeholder_"))
 
 
+def _is_value_boundary_placeholder(text: str, start: int, end: int) -> bool:
+    """True when the placeholder occupies the whole trimmed string value.
+
+    Ingestion replaces an entire tool-call argument (or field) with a single
+    placeholder, so a real reference always sits at the value boundary. A
+    placeholder embedded mid-string inside a larger document is quoted example
+    text - a patch payload, a doc snippet, or captured test output.
+    """
+    return not text[:start].strip() and not text[end:].strip()
+
+
 def _extract_unescaped_externalized_payload_refs(text: str, *, ignore_quoted_spans: bool = False) -> list[str]:
     refs: list[str] = []
     for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
@@ -1679,6 +1690,49 @@ def _extract_unescaped_externalized_payload_refs(text: str, *, ignore_quoted_spa
     return refs
 
 
+def _extract_document_value_externalized_payload_refs(text: str) -> list[str]:
+    """Return refs from a string value inside a parsed JSON document.
+
+    TROVE's own ingest placeholders use the existing example heuristics
+    (example-looking ref names, quoted example spans, escaped-quote context),
+    because a real ingest reference legitimately sits mid-value - in a caption,
+    a log line, or tool-call metadata.
+
+    The legacy ``GC'd externalized tool output`` marker gets one extra rule: it
+    only counts when it spans the whole trimmed value. The same marker text
+    embedded mid-value is quoted example content (a patch payload, a test
+    fixture, documentation) rather than a live reference, and the legacy
+    format has no field= provenance to tell the two apart.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+    stripped = text.strip()
+    if is_externalized_ingest_placeholder(stripped) or is_externalized_placeholder(stripped):
+        return extract_all_externalized_payload_refs(stripped)
+    refs: list[str] = []
+    for match in _INGEST_PLACEHOLDER_RE.finditer(text):
+        ref = match.group(1).strip()
+        if not _is_basename_ref(ref):
+            continue
+        if (
+            _looks_like_example_payload_ref(ref)
+            and (
+                _is_escaped_placeholder_example(text, match.start())
+                or _is_quoted_placeholder_example(text, match.start())
+            )
+        ):
+            continue
+        _append_unique_refs(refs, [ref])
+    for match in _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE.finditer(text):
+        ref = match.group(1).strip()
+        if not _is_basename_ref(ref):
+            continue
+        if not _is_value_boundary_placeholder(text, match.start(), match.end()):
+            continue
+        _append_unique_refs(refs, [ref])
+    return refs
+
+
 def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) -> list[str]:
     """Return refs that plausibly came from TROVE storage-boundary placeholders.
 
@@ -1695,14 +1749,37 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
     stripped = value.strip()
     if is_externalized_ingest_placeholder(stripped) or is_externalized_placeholder(stripped):
         return extract_all_externalized_payload_refs(stripped)
+    if field == "content":
+        parsed_content = _maybe_parse_json_string(value)
+        if parsed_content is not None:
+            # A content field that is itself a JSON document is captured tool
+            # output (pytest results, API envelopes, ...). Keep only TROVE's own
+            # ingest placeholders inside it; legacy/narrative marker examples
+            # inside JSON-escaped strings are documentation, not live refs.
+            refs: list[str] = []
+            for nested in _walk_string_values(parsed_content):
+                if is_externalized_ingest_placeholder(nested.strip()):
+                    _append_unique_refs(refs, extract_all_externalized_payload_refs(nested.strip()))
+            return refs
     if field == "tool_calls":
-        refs = _extract_unescaped_externalized_payload_refs(value, ignore_quoted_spans=True)
-        parsed = _maybe_parse_json_string(value)
+        parsed_container = _maybe_parse_json_string(value)
+        if parsed_container is not None:
+            # value is a JSON document. Skip the permissive raw scan: every
+            # match here would be embedded text inside the document, which is
+            # quoted example content (patch/test/doc payloads), not a live
+            # reference. The parsed walk below decides what actually counts.
+            refs = []
+        else:
+            refs = _extract_unescaped_externalized_payload_refs(value, ignore_quoted_spans=True)
+        parsed = parsed_container
         if parsed is None:
             return refs
         for argument in _walk_tool_call_argument_values(parsed):
             if isinstance(argument, str):
-                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(argument, ignore_quoted_spans=True))
+                if _maybe_parse_json_string(argument) is not None:
+                    _append_unique_refs(refs, _extract_document_value_externalized_payload_refs(argument))
+                else:
+                    _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(argument, ignore_quoted_spans=True))
                 parsed_argument = _maybe_parse_json_string(argument)
                 if parsed_argument is not None:
                     for nested in _walk_string_values(parsed_argument):
@@ -1712,7 +1789,7 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
                         else:
                             _append_unique_refs(
                                 refs,
-                                _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True),
+                                _extract_document_value_externalized_payload_refs(nested),
                             )
             else:
                 for nested in _walk_string_values(argument):
@@ -1726,7 +1803,10 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
             if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
                 _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
             else:
-                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
+                # Every remaining string is a value inside a parsed document,
+                # so the provenance rules in the helper apply: ingest markers
+                # stay trusted mid-value, legacy markers need the boundary.
+                _append_unique_refs(refs, _extract_document_value_externalized_payload_refs(nested))
         return refs
     if role == "tool":
         refs = _extract_unescaped_externalized_payload_refs(value)
