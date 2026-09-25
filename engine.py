@@ -6879,6 +6879,12 @@ class TROVEEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySes
     # -- Lifecycle ---------------------------------------------------------
 
     def shutdown(self):
+        try:
+            from .embed_worker import shutdown_auto_backfill
+
+            shutdown_auto_backfill()
+        except Exception as exc:  # noqa: BLE001 — shutdown must still close stores
+            logger.debug("TROVE auto-backfill shutdown error: %s", exc)
         self._unregister_active_engine_binding()
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.close()

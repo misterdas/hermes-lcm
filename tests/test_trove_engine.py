@@ -65,6 +65,24 @@ def externalized_search_engine(tmp_path):
         instance.shutdown()
 
 
+def test_shutdown_stops_auto_backfill_scheduler(tmp_path, monkeypatch):
+    """Engine shutdown must stop embedding timers before closing its stores."""
+    from hermes_trove import embed_worker
+
+    calls = []
+    monkeypatch.setattr(
+        embed_worker,
+        "shutdown_auto_backfill",
+        lambda: calls.append("scheduler"),
+    )
+    config = TROVEConfig(database_path=str(tmp_path / "shutdown-embed.db"))
+    engine = TROVEEngine(config=config)
+
+    engine.shutdown()
+
+    assert calls == ["scheduler"]
+
+
 def test_shutdown_closes_lifecycle_store(tmp_path):
     config = TROVEConfig(database_path=str(tmp_path / "shutdown-lifecycle.db"))
     engine = TROVEEngine(config=config)
