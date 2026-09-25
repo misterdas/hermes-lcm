@@ -12,7 +12,6 @@ still depends on SQLite WAL recovery.
 from __future__ import annotations
 
 import sqlite3
-import sys
 import threading
 from pathlib import Path
 
@@ -87,22 +86,39 @@ class TestConfigureConnectionPragmas:
         conn.close()
         assert val == 67_108_864, f"expected journal_size_limit=67108864, got {val}"
 
-    def test_mmap_size(self, db_path: Path):
+    def test_mmap_size_disabled_by_default(self, db_path: Path):
+        """mmap stays off everywhere: a TROVE store is multi-writer.
+
+        Memory-mapped I/O is only safe while every process shares one
+        page-cache view. The gateway, the desktop `serve` backend, a subagent
+        and an operator script all open the same store, and a WAL writer
+        updating pages under a stale reader mapping is what produced
+        B-tree/FTS corruption on a 3-writer host.
+        """
         conn = sqlite3.connect(str(db_path))
         configure_connection(conn)
         val = conn.execute("PRAGMA mmap_size").fetchone()[0]
         conn.close()
-        expected = 0 if sys.platform == "darwin" else 268_435_456
-        assert val == expected, f"expected mmap_size={expected}, got {val}"
+        assert val == 0, f"expected mmap disabled by default, got {val}"
 
     def test_mmap_size_override(self, db_path: Path, monkeypatch):
-        target = 268_435_456 if sys.platform == "darwin" else 0
+        """An operator on a verified single-writer host can re-enable mmap."""
+        target = 268_435_456
         monkeypatch.setenv("TROVE_MMAP_SIZE", str(target))
         conn = sqlite3.connect(str(db_path))
         configure_connection(conn)
         val = conn.execute("PRAGMA mmap_size").fetchone()[0]
         conn.close()
         assert val == target, f"expected mmap_size={target}, got {val}"
+
+    def test_mmap_size_invalid_override_disables_mmap(self, db_path: Path, monkeypatch):
+        """A malformed override must fail safe (mmap off), never to a guess."""
+        monkeypatch.setenv("TROVE_MMAP_SIZE", "not-a-number")
+        conn = sqlite3.connect(str(db_path))
+        configure_connection(conn)
+        val = conn.execute("PRAGMA mmap_size").fetchone()[0]
+        conn.close()
+        assert val == 0, f"expected mmap disabled on bad override, got {val}"
 
 
 # --------------------------------------------------------------------------- #

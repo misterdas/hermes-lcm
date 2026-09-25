@@ -15,7 +15,6 @@ import os
 import re
 import shutil
 import sqlite3
-import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -175,8 +174,16 @@ def configure_connection(conn: sqlite3.Connection) -> None:
                                              or cap growth while another
                                              connection holds an old WAL
                                              end mark.
-    - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
-                                              readers cache WAL pages in RAM.
+    - mmap_size=0 (disabled)           : reads use POSIX pread/pwrite through the
+                              unified page cache rather than memory-mapped I/O.
+                              A TROVE store is opened by several processes at
+                              once (gateway, desktop serve, subagent, cron, an
+                              operator script); mmap is only safe while every
+                              process shares one page-cache view, and a writer
+                              updating the WAL under a stale reader mapping is
+                              what produces B-tree/FTS corruption and spurious
+                              SQLITE_IOERR. Re-enable with TROVE_MMAP_SIZE only
+                              on a verified single-writer deployment.
     """
     busy_timeout = int(os.environ.get("TROVE_BUSY_TIMEOUT_MS", str(SQLITE_BUSY_TIMEOUT_MS)))
     conn.execute(f"PRAGMA busy_timeout={busy_timeout}")
@@ -190,13 +197,29 @@ def configure_connection(conn: sqlite3.Connection) -> None:
             mmap_size = int(mmap_env)
         except ValueError:
             mmap_size = 0
-    elif sys.platform == "darwin":
-        # On macOS APFS, memory-mapped I/O (PRAGMA mmap_size > 0) causes cache incoherence
-        # and B-tree/FTS corruption under multi-process concurrency (gateway + desktop serve + subagents).
-        # Default to 0 (disabled) on Darwin to force POSIX pread/pwrite via the unified kernel page cache.
-        mmap_size = 0
     else:
-        mmap_size = 268435456
+        # mmap is OFF by default on every platform.
+        #
+        # A TROVE store is routinely opened by SEVERAL processes at once: the
+        # gateway, the desktop `serve` backend, a subagent, a cron agent, and an
+        # operator running a one-off script. Memory-mapped I/O is only safe while
+        # every process observes the same page cache; when one process writes
+        # through the WAL while another reads the same pages through a stale
+        # mapping, the reader's view of the B-tree and FTS shadow tables diverges
+        # and the store reports `database disk image is malformed` — page
+        # duplication and child-depth errors in the integrity check.
+        #
+        # This is not theoretical: on a 3-writer host it corrupted trove.db twice
+        # in one day, both times while writing embeddings, and the read path
+        # also returned a spurious SQLITE_IOERR because a pure read-only handle
+        # cannot recover a WAL it has no mapping for. Darwin was already
+        # disabled here for the same class of reason; POSIX pread/pwrite through
+        # the unified page cache is correct on every platform and the cost is a
+        # syscall on cold pages, which is negligible next to a losing writes.
+        #
+        # Operators who have verified a single-writer deployment can re-enable it
+        # with TROVE_MMAP_SIZE=268435456.
+        mmap_size = 0
     conn.execute(f"PRAGMA mmap_size={mmap_size}")
 
 

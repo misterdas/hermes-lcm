@@ -1979,6 +1979,15 @@ class VectorStore:
                 check_same_thread=False,
             )
             conn.row_factory = sqlite3.Row
+            # A read-only handle still needs busy_timeout: without it SQLite
+            # returns SQLITE_BUSY the instant another process holds the write
+            # lock, instead of waiting. It also needs the shared read pragmas
+            # (synchronous is a no-op for reads, but busy_timeout and the
+            # mmap setting are not) so a pooled reader observes the same page
+            # view as the writer. Omitting this produced a spurious
+            # "disk I/O error" on a busy multi-writer store.
+            conn.execute(f"PRAGMA busy_timeout={int(max(0.001, remaining) * 1000)}")
+            conn.execute("PRAGMA mmap_size=0")
             conn.set_progress_handler(interrupt_if_expired, 1000)
             reader = copy.copy(self)
             reader._conn = conn
