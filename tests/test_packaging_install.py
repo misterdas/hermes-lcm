@@ -292,6 +292,35 @@ def test_install_script_creates_profile_aware_symlink_and_prints_activation_step
     assert str(skill_target) in result.stdout
 
 
+def test_uninstall_survives_missing_yaml_dependency(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir(parents=True)
+    config = hermes_home / "config.yaml"
+    config.write_text(
+        "plugins:\n  enabled:\n    - hermes-trove\ncontext:\n  engine: trove\n",
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python_stub = fake_bin / "python3"
+    python_stub.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    python_stub.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(repo_root / "scripts" / "uninstall.sh")],
+        cwd=repo_root,
+        env={**os.environ, "HERMES_HOME": str(hermes_home), "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "config cleanup requires PyYAML" in result.stdout
+    assert config.exists()
+
+
 def test_install_script_configures_activation_when_name_only_appears_in_comment(tmp_path):
     repo_root = Path(__file__).resolve().parent.parent
     hermes_home = tmp_path / "hermes-home"

@@ -48,8 +48,9 @@ fi
 
 # Remove hermes-trove sections from config.yaml
 if [[ -f "$CONFIG" ]]; then
-  # Use Python to properly remove the YAML sections
-  python3 -c "
+  if python3 -c 'import yaml' >/dev/null 2>&1; then
+    # Use Python to properly remove the YAML sections
+    python3 -c "
 import yaml, sys
 
 with open('$CONFIG') as f:
@@ -78,6 +79,9 @@ if changed:
 else:
     print('config.yaml already clean')
 "
+  else
+    echo "config cleanup requires PyYAML; left $CONFIG unchanged"
+  fi
 fi
 
 if [[ "$removed" == "false" ]]; then
