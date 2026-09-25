@@ -23,6 +23,7 @@ import uuid
 from typing import Any, Optional
 
 from . import command as command_mod
+from .db_bootstrap import log_sqlite_failure
 from .command import (
     _EMBEDDING_BACKFILL_BATCH_SIZE,
     _EMBEDDING_BACKFILL_CLAIM_KEY,
@@ -140,7 +141,13 @@ class _EmbedAutoBackfillScheduler:
         try:
             read_conn = _embedding_read_connection(db_path)
         except sqlite3.Error as exc:
-            logger.debug("TROVE auto-backfill: cannot open db: %s", exc)
+            log_sqlite_failure(
+                exc,
+                store="embedding_backfill",
+                operation="open_read_connection",
+                db_path=db_path,
+                logger_obj=logger,
+            )
             return
 
         try:

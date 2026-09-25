@@ -1,15 +1,53 @@
+import logging
+import sqlite3
 import threading
 import time
 
 import pytest
 
 from hermes_trove.config import TROVEConfig
+from hermes_trove.db_bootstrap import log_sqlite_failure, sqlite_failure_diagnostic
 from hermes_trove.dag import SummaryDAG
 from hermes_trove.engine import TROVEEngine
 from hermes_trove.lifecycle_state import LifecycleStateStore
 from hermes_trove.query_view_store import QueryViewStore
 from hermes_trove.rollup_store import RollupStore
 from hermes_trove.store import MessageStore
+
+
+def test_sqlite_failure_diagnostic_is_structured_and_does_not_include_exception_text():
+    error = sqlite3.OperationalError("database is locked: secret conversation text")
+    diagnostic = sqlite_failure_diagnostic(
+        error,
+        store="MessageStore",
+        operation="append",
+        db_path="/tmp/trove.db",
+    )
+    assert diagnostic == {
+        "store": "MessageStore",
+        "operation": "append",
+        "db_path": "/tmp/trove.db",
+        "error_type": "OperationalError",
+        "sqlite_errorcode": None,
+        "retryable": True,
+    }
+    assert "secret conversation text" not in repr(diagnostic)
+
+
+def test_log_sqlite_failure_emits_metadata_without_exception_text(caplog):
+    error = sqlite3.OperationalError("database is locked: private prompt")
+    with caplog.at_level(logging.WARNING):
+        diagnostic = log_sqlite_failure(
+            error,
+            store="VectorStore",
+            operation="publish",
+            db_path="/tmp/trove.db",
+        )
+    assert diagnostic["retryable"] is True
+    record = caplog.records[-1]
+    assert "VectorStore" in record.getMessage()
+    assert "publish" in record.getMessage()
+    assert "private prompt" not in record.getMessage()
 
 
 def test_query_view_store_transaction_is_reentrant(tmp_path):

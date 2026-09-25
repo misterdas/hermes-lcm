@@ -72,6 +72,54 @@ class ExternalContentFtsSpec:
         self.trigger_sqls = tuple(trigger_sqls)
 
 
+def sqlite_failure_diagnostic(
+    exc: BaseException,
+    *,
+    store: str,
+    operation: str,
+    db_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """Return safe operational metadata for a SQLite failure.
+
+    The diagnostic intentionally excludes SQL text, parameters, prompt content,
+    and exception text because either side may contain conversation data.
+    """
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    return {
+        "store": store,
+        "operation": operation,
+        "db_path": str(db_path) if db_path is not None else None,
+        "error_type": type(exc).__name__,
+        "sqlite_errorcode": int(error_code) if isinstance(error_code, int) else None,
+        "retryable": _is_sqlite_lock_error(exc),
+    }
+
+
+def log_sqlite_failure(
+    exc: BaseException,
+    *,
+    store: str,
+    operation: str,
+    db_path: str | os.PathLike[str] | None = None,
+    logger_obj: logging.Logger | None = None,
+) -> dict[str, object]:
+    """Log safe SQLite failure metadata and return it for callers/tests."""
+    diagnostic = sqlite_failure_diagnostic(
+        exc, store=store, operation=operation, db_path=db_path
+    )
+    (logger_obj or logger).warning(
+        "TROVE SQLite operation failed store=%s operation=%s db_path=%s "
+        "error_type=%s sqlite_errorcode=%s retryable=%s",
+        diagnostic["store"],
+        diagnostic["operation"],
+        diagnostic["db_path"],
+        diagnostic["error_type"],
+        diagnostic["sqlite_errorcode"],
+        diagnostic["retryable"],
+    )
+    return diagnostic
+
+
 def _is_sqlite_lock_error(exc: BaseException) -> bool:
     """Return True when an exception chain represents SQLite lock contention."""
     lock_codes = {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
