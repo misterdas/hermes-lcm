@@ -84,14 +84,15 @@ class LifecycleStateStore:
         self._conn.commit()
 
     def close(self) -> None:
-        conn = getattr(self, "_conn", None)
-        if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
-            self._conn = None
+        with self._lock:
+            conn = getattr(self, "_conn", None)
+            if conn is not None:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass
+                conn.close()
+                self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:
