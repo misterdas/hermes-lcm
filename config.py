@@ -458,6 +458,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("embedding_query_spend_backoff_seconds", "TROVE_EMBEDDING_QUERY_SPEND_BACKOFF_SECONDS", float),
     _EnvFieldSpec("embed_auto_backfill_enabled", "TROVE_EMBED_AUTO_BACKFILL", bool),
     _EnvFieldSpec("embed_auto_backfill_debounce_s", "TROVE_EMBED_AUTO_BACKFILL_DEBOUNCE_S", float),
+    _EnvFieldSpec("embed_chunk_auto_backfill_enabled", "TROVE_EMBED_CHUNK_AUTO_BACKFILL", bool),
     _EnvFieldSpec("new_session_retain_depth", "TROVE_NEW_SESSION_RETAIN_DEPTH", int),
     _EnvFieldSpec("doctor_clean_apply_enabled", "TROVE_DOCTOR_CLEAN_APPLY_ENABLED", bool),
     _EnvFieldSpec("slash_commands_enabled", "TROVE_ENABLE_SLASH_COMMAND", bool),
@@ -817,6 +818,16 @@ class TROVEConfig:
     # Debounce window in seconds. A burst of ingests coalesces into a
     # single background run. Default 30.0; set <= 0 to force 30.0.
     embed_auto_backfill_debounce_s: float = 30.0
+    # Embed the chunk corpus (raw message text) in the background too.
+    #
+    # The summary corpus is TROVE-generated, so the worker embeds it without
+    # asking. The chunk corpus is the operator's own message text, so this
+    # stays OFF by default: setting this var to 1 is the standing consent that
+    # raw text may be embedded, which is why the worker passes
+    # confirm_raw_text=True on the operator's behalf. With it on, one bounded
+    # batch is embedded per debounce and verbatim recall stays current without
+    # a manual `/trove embed backfill --corpus chunks --apply` per session.
+    embed_chunk_auto_backfill_enabled: bool = False
 
     # -- Session carry-over ---
     # Depth retained after /new (-1 = all, 0 = nothing, 2 = keep d2+)

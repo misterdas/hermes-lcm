@@ -36,7 +36,13 @@ class FakeProvider:
         return [[float(index + 1), 1.0] for index, _text in enumerate(current)]
 
 
-def _engine(tmp_path, *, enabled: bool = True, auto_backfill: bool = False):
+def _engine(
+    tmp_path,
+    *,
+    enabled: bool = True,
+    auto_backfill: bool = False,
+    chunk_auto_backfill: bool = False,
+):
     tmp_path.mkdir(parents=True, exist_ok=True)
     db_path = tmp_path / "backfill.db"
     config = TROVEConfig(
@@ -46,6 +52,7 @@ def _engine(tmp_path, *, enabled: bool = True, auto_backfill: bool = False):
         embedding_model="model-a",
         embed_auto_backfill_enabled=auto_backfill,
         embed_auto_backfill_debounce_s=300.0 if auto_backfill else 30.0,
+        embed_chunk_auto_backfill_enabled=chunk_auto_backfill,
     )
     return SimpleNamespace(
         _config=config,
@@ -361,3 +368,84 @@ def test_provider_not_configured_noop(tmp_path, monkeypatch):
 
     scheduler._do_auto_backfill(engine)
     assert _meta_ids(engine) == []
+
+
+# --- opt-in chunk-corpus auto-backfill (TROVE_EMBED_CHUNK_AUTO_BACKFILL) ---
+#
+# The chunk corpus is the operator's raw message text, so embedding it in the
+# background is a consent decision. These tests pin the boundary: off by
+# default, never invoked unless the operator opted in.
+
+
+def test_chunk_auto_backfill_is_off_by_default():
+    """Raw message text must never be embedded without an explicit opt-in."""
+    assert TROVEConfig().embed_chunk_auto_backfill_enabled is False
+
+
+def test_chunk_auto_backfill_not_invoked_when_disabled(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, enabled=True, auto_backfill=True, chunk_auto_backfill=False)
+    _seed(engine, 3)
+
+    scheduler = _fresh_scheduler()
+    monkeypatch.setattr(worker_mod, "_EMBED_AUTO_BACKFILL_SCHEDULER", scheduler)
+    spy = MagicMock(return_value=False)
+    monkeypatch.setattr(scheduler, "_do_auto_chunk_backfill", spy)
+
+    # The real _do_auto_backfill must run so the chunk dispatch inside it is
+    # the thing under test. Report no active profile so the summary pass exits
+    # before touching a provider.
+    monkeypatch.setattr(worker_mod, "_embedding_current_profile", lambda *a, **k: None)
+    scheduler._do_auto_backfill(engine)
+    spy.assert_not_called()
+
+
+def test_chunk_auto_backfill_invoked_when_enabled(tmp_path, monkeypatch):
+    """The opt-in runs the chunk pass through the real command path."""
+    engine = _engine(tmp_path, enabled=True, auto_backfill=True, chunk_auto_backfill=True)
+    _seed(engine, 3)
+
+    scheduler = _fresh_scheduler()
+    monkeypatch.setattr(worker_mod, "_EMBED_AUTO_BACKFILL_SCHEDULER", scheduler)
+    spy = MagicMock(return_value=False)
+    monkeypatch.setattr(scheduler, "_do_auto_chunk_backfill", spy)
+    # No active profile => the summary pass returns before reaching a provider.
+    monkeypatch.setattr(worker_mod, "_embedding_current_profile", lambda *a, **k: None)
+
+    scheduler._do_auto_backfill(engine)
+    spy.assert_called_once_with(engine)
+
+
+def test_chunk_auto_backfill_failure_does_not_break_the_summary_pass(tmp_path, monkeypatch):
+    """A chunk-corpus error must not stop the summary worker."""
+    engine = _engine(tmp_path, enabled=True, auto_backfill=True, chunk_auto_backfill=True)
+    _seed(engine, 3)
+
+    scheduler = _fresh_scheduler()
+    monkeypatch.setattr(worker_mod, "_EMBED_AUTO_BACKFILL_SCHEDULER", scheduler)
+    monkeypatch.setattr(
+        scheduler, "_do_auto_chunk_backfill", MagicMock(side_effect=RuntimeError("boom"))
+    )
+    summary = MagicMock(return_value=False)
+    monkeypatch.setattr(scheduler, "_do_auto_backfill", summary)
+
+    # Must not raise.
+    scheduler._run_auto_backfill(engine)
+
+
+def test_chunk_auto_backfill_reports_more_work(tmp_path, monkeypatch):
+    """A non-zero `remaining:` makes the scheduler debounce again."""
+    engine = _engine(tmp_path, enabled=True, auto_backfill=True, chunk_auto_backfill=True)
+    _seed(engine, 3)
+
+    scheduler = _fresh_scheduler()
+    monkeypatch.setattr(worker_mod, "_EMBED_AUTO_BACKFILL_SCHEDULER", scheduler)
+    fake_report = "status: partial\nremaining: 42\n"
+    monkeypatch.setattr(
+        command_mod, "_chunk_backfill_text", lambda *a, **k: fake_report
+    )
+    assert scheduler._do_auto_chunk_backfill(engine) is True
+
+    monkeypatch.setattr(
+        command_mod, "_chunk_backfill_text", lambda *a, **k: "status: complete\nremaining: 0\n"
+    )
+    assert scheduler._do_auto_chunk_backfill(engine) is False

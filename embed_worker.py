@@ -137,6 +137,21 @@ class _EmbedAutoBackfillScheduler:
         db_path = engine._store.db_path
         has_more = False
 
+        # The summary corpus is TROVE-generated, so the background worker
+        # embeds it without asking. The chunk corpus is the operator's RAW
+        # message text, so it stays opt-in: set TROVE_EMBED_CHUNK_AUTO_BACKFILL=1
+        # to consent once and keep verbatim recall current without a manual
+        # `/trove embed backfill --corpus chunks --apply` after every session.
+        # It runs AFTER the summary pass, one bounded batch per debounce, and
+        # goes through the same lease, so a manual run and the worker still
+        # exclude each other rather than double-embedding.
+        if bool(getattr(config, "embed_chunk_auto_backfill_enabled", False)):
+            try:
+                if self._do_auto_chunk_backfill(engine):
+                    has_more = True
+            except Exception as exc:  # noqa: BLE001 — background worker
+                logger.debug("TROVE auto chunk-backfill error: %s", exc)
+
         # --- Fast path: check pending count (read-only, cheap, no lock) ---
         try:
             read_conn = _embedding_read_connection(db_path)
@@ -285,6 +300,43 @@ class _EmbedAutoBackfillScheduler:
         finally:
             store.close()
         return has_more
+
+    def _do_auto_chunk_backfill(self, engine: Any) -> bool:
+        """Embed one bounded batch of pending chunk-corpus documents.
+
+        Delegates to the SAME ``_chunk_backfill_text`` implementation the
+        slash command uses, so consent gating, the cloud-provider
+        ``--confirm-raw-text`` refusal, identity capture, the lease, the
+        per-row inflight bookkeeping, and the partial-progress report are
+        identical — there is no second code path to keep in sync. A local
+        provider (fastembed/ollama) needs no raw-text consent; a cloud
+        provider is refused unless the operator has already acknowledged it
+        via TROVE_EMBED_CHUNK_AUTO_BACKFILL, since that env var IS the
+        standing consent.
+
+        Returns True when work remains, so the scheduler debounces again.
+        """
+        from .command import _chunk_backfill_text  # local: avoids an import cycle
+
+        report = _chunk_backfill_text(
+            engine,
+            apply=True,
+            limit=_EMBEDDING_BACKFILL_BATCH_SIZE,
+            retry_uncertain=False,
+            policy="conversational",
+            confirm_raw_text=True,
+            expected_dtype=None,
+        )
+        remaining = 0
+        for line in str(report).splitlines():
+            if line.startswith("remaining:"):
+                try:
+                    remaining = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    remaining = 0
+                break
+        logger.debug("TROVE auto chunk-backfill: %d remaining", remaining)
+        return remaining > 0
 
     def shutdown(self) -> None:
         """Stop accepting new debounces.
