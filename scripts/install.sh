@@ -91,8 +91,7 @@ EOF
 # out the user's existing plugin list).
 CONFIG="$TARGET_ROOT/config.yaml"
 if [[ -f "$CONFIG" ]]; then
-  if ! grep -q "hermes-trove" "$CONFIG" 2>/dev/null; then
-    if python3 - "$CONFIG" <<'PY'
+  if python3 - "$CONFIG" <<'PY'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1])
 try:
@@ -107,7 +106,8 @@ enabled = plugins.setdefault("enabled", [])
 if "hermes-trove" not in enabled:
     enabled.append("hermes-trove")
 context = data.setdefault("context", {})
-context.setdefault("engine", "trove")
+if context.get("engine") in (None, "", "default"):
+    context["engine"] = "trove"
 tmp = p.with_suffix(".yaml.trovetmp")
 tmp.write_text(yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
 tmp.replace(p)
@@ -123,9 +123,6 @@ PY
       echo "  context:"
       echo "    engine: trove"
     fi
-  else
-    echo "config.yaml already has hermes-trove activation"
-  fi
 else
   echo "No config.yaml found at $CONFIG — add manually:"
   echo "  plugins:"

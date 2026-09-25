@@ -292,6 +292,70 @@ def test_install_script_creates_profile_aware_symlink_and_prints_activation_step
     assert str(skill_target) in result.stdout
 
 
+def test_install_script_configures_activation_when_name_only_appears_in_comment(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir(parents=True)
+    config = hermes_home / "config.yaml"
+    config.write_text(
+        "# hermes-trove is intentionally not enabled yet\n"
+        "plugins:\n"
+        "  enabled:\n"
+        "    - other-plugin\n"
+        "context:\n"
+        "  engine: default\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(repo_root / "scripts" / "install.sh")],
+        cwd=repo_root,
+        env={
+            "HOME": str(tmp_path / "home"),
+            "HERMES_HOME": str(hermes_home),
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    configured = config.read_text(encoding="utf-8")
+    assert "- other-plugin" in configured
+    assert configured.count("- hermes-trove") == 1
+    assert "engine: trove" in configured
+    assert "engine: default" not in configured
+    assert "Auto-configured" in result.stdout
+
+
+def test_install_script_preserves_explicit_non_trove_context_engine(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir(parents=True)
+    config = hermes_home / "config.yaml"
+    config.write_text(
+        "context:\n"
+        "  engine: another-engine\n",
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        ["bash", str(repo_root / "scripts" / "install.sh")],
+        cwd=repo_root,
+        env={
+            "HOME": str(tmp_path / "home"),
+            "HERMES_HOME": str(hermes_home),
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    configured = config.read_text(encoding="utf-8")
+    assert "- hermes-trove" in configured
+    assert "engine: another-engine" in configured
+    assert "engine: trove" not in configured
+
+
 def test_install_script_is_idempotent_for_plugin_and_skill_links(tmp_path):
     repo_root = Path(__file__).resolve().parent.parent
     hermes_home = tmp_path / "hermes-home"
