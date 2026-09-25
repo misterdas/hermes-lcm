@@ -540,6 +540,7 @@ class QueryViewStore:
             str(self.db_path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS, check_same_thread=False
         )
         self._write_lock = threading.RLock()
+        self._transaction_depth = 0
         try:
             refuse_schema_version_too_new(self._conn)
             configure_connection(self._conn)
@@ -565,12 +566,27 @@ class QueryViewStore:
         with self._write_lock:
             if self._conn is None:
                 raise RuntimeError("query-view store is closed")
-            self._conn.execute("BEGIN IMMEDIATE")
+            nested = self._transaction_depth > 0
+            savepoint = f"query_view_txn_{self._transaction_depth}"
+            if nested:
+                self._conn.execute(f"SAVEPOINT {savepoint}")
+            else:
+                self._conn.execute("BEGIN IMMEDIATE")
+            self._transaction_depth += 1
             try:
                 yield
-                self._conn.execute("COMMIT")
+                self._transaction_depth -= 1
+                if nested:
+                    self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                else:
+                    self._conn.execute("COMMIT")
             except Exception:
-                self._conn.execute("ROLLBACK")
+                self._transaction_depth -= 1
+                if nested:
+                    self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                else:
+                    self._conn.execute("ROLLBACK")
                 raise
 
     @staticmethod

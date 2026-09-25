@@ -5,8 +5,43 @@ import pytest
 
 from hermes_trove.dag import SummaryDAG
 from hermes_trove.lifecycle_state import LifecycleStateStore
+from hermes_trove.query_view_store import QueryViewStore
 from hermes_trove.rollup_store import RollupStore
 from hermes_trove.store import MessageStore
+
+
+def test_query_view_store_transaction_is_reentrant(tmp_path):
+    db_path = tmp_path / "query-view.db"
+    source_store = MessageStore(db_path)
+    source_store.close()
+    store = QueryViewStore(db_path)
+    try:
+        with store._write_transaction():
+            store._conn.execute("CREATE TABLE nested_test (id INTEGER PRIMARY KEY)")
+            with store._write_transaction():
+                store._conn.execute("INSERT INTO nested_test(id) VALUES (1)")
+        assert store._conn.execute("SELECT id FROM nested_test").fetchone()[0] == 1
+    finally:
+        store.close()
+
+
+def test_query_view_store_nested_transaction_failure_rolls_back_only_inner_work(tmp_path):
+    db_path = tmp_path / "query-view-rollback.db"
+    source_store = MessageStore(db_path)
+    source_store.close()
+    store = QueryViewStore(db_path)
+    try:
+        with store._write_transaction():
+            store._conn.execute("CREATE TABLE nested_rollback_test (id INTEGER PRIMARY KEY)")
+            store._conn.execute("INSERT INTO nested_rollback_test(id) VALUES (1)")
+            with pytest.raises(RuntimeError, match="inner failure"):
+                with store._write_transaction():
+                    store._conn.execute("INSERT INTO nested_rollback_test(id) VALUES (2)")
+                    raise RuntimeError("inner failure")
+        rows = store._conn.execute("SELECT id FROM nested_rollback_test ORDER BY id").fetchall()
+        assert [row[0] for row in rows] == [1]
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize(
