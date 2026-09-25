@@ -135,13 +135,16 @@ fi
 # Enable slash commands
 ENV_FILE="$TARGET_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
-  if grep -q "TROVE_ENABLE_SLASH_COMMAND" "$ENV_FILE" 2>/dev/null; then
+  if [[ -s "$ENV_FILE" && "$(tail -c 1 "$ENV_FILE" | wc -l)" -eq 0 ]]; then
+    printf '\n' >> "$ENV_FILE"
+  fi
+  if awk -F= '/^[[:space:]]*TROVE_ENABLE_SLASH_COMMAND=/ { found=1 } END { exit !found }' "$ENV_FILE"; then
     echo "Slash commands already configured in $ENV_FILE"
   else
     echo "TROVE_ENABLE_SLASH_COMMAND=1" >> "$ENV_FILE"
     echo "Added TROVE_ENABLE_SLASH_COMMAND=1 to $ENV_FILE"
   fi
-  if grep -q "TROVE_RETENTION_DAYS" "$ENV_FILE" 2>/dev/null; then
+  if awk -F= '/^[[:space:]]*TROVE_RETENTION_DAYS=/ { found=1 } END { exit !found }' "$ENV_FILE"; then
     echo "TROVE_RETENTION_DAYS already configured in $ENV_FILE"
   else
     echo "TROVE_RETENTION_DAYS=0" >> "$ENV_FILE"

@@ -18,6 +18,24 @@ ENV_FILE="$TARGET_ROOT/.env"
 
 removed=false
 foreign_checkout=false
+mixed_ownership=false
+plugin_owned=false
+skill_owned=false
+
+# Refuse mixed ownership before mutating either link; otherwise uninstall
+# could remove this checkout while leaving a foreign component active.
+plugin_foreign=false
+skill_foreign=false
+if [[ -L "$PLUGIN_TARGET" && "$(readlink "$PLUGIN_TARGET")" != "$REPO_ROOT" ]]; then
+  plugin_foreign=true
+fi
+if [[ -L "$SKILL_TARGET" && "$(readlink "$SKILL_TARGET")" != "$REPO_ROOT/skills/hermes-trove" ]]; then
+  skill_foreign=true
+fi
+if [[ "$plugin_foreign" == true && -L "$SKILL_TARGET" && "$(readlink "$SKILL_TARGET")" == "$REPO_ROOT/skills/hermes-trove" ]] || [[ "$skill_foreign" == true && -L "$PLUGIN_TARGET" && "$(readlink "$PLUGIN_TARGET")" == "$REPO_ROOT" ]]; then
+  echo "Refusing partial uninstall: plugin and skill belong to different checkouts" >&2
+  exit 0
+fi
 
 # Remove plugin symlink
 if [[ -L "$PLUGIN_TARGET" ]]; then
@@ -25,6 +43,7 @@ if [[ -L "$PLUGIN_TARGET" ]]; then
   if [[ "$target" == "$REPO_ROOT" ]]; then
     rm "$PLUGIN_TARGET"
     echo "Removed plugin symlink: $PLUGIN_TARGET"
+    plugin_owned=true
     removed=true
   else
     foreign_checkout=true

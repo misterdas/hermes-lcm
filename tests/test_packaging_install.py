@@ -292,6 +292,100 @@ def test_install_script_creates_profile_aware_symlink_and_prints_activation_step
     assert str(skill_target) in result.stdout
 
 
+def test_install_env_detection_ignores_comments_and_substrings(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir(parents=True)
+    env_file = hermes_home / ".env"
+    env_file.write_text(
+        "# TROVE_ENABLE_SLASH_COMMAND=1\n"
+        "OTHER_TROVE_ENABLE_SLASH_COMMAND=1\n"
+        "TROVE_RETENTION_DAYS=0\n",
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        ["bash", str(repo_root / "scripts" / "install.sh")],
+        cwd=repo_root,
+        env={**os.environ, "HOME": str(tmp_path / "home"), "HERMES_HOME": str(hermes_home)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert lines.count("TROVE_ENABLE_SLASH_COMMAND=1") == 1
+    assert "OTHER_TROVE_ENABLE_SLASH_COMMAND=1" in lines
+    assert lines.count("TROVE_RETENTION_DAYS=0") == 1
+
+
+def test_install_env_append_adds_missing_newline(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir(parents=True)
+    env_file = hermes_home / ".env"
+    env_file.write_text("OTHER_SETTING=value", encoding="utf-8")
+
+    subprocess.run(
+        ["bash", str(repo_root / "scripts" / "install.sh")],
+        cwd=repo_root,
+        env={**os.environ, "HOME": str(tmp_path / "home"), "HERMES_HOME": str(hermes_home)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert env_file.read_text(encoding="utf-8").splitlines() == [
+        "OTHER_SETTING=value",
+        "TROVE_ENABLE_SLASH_COMMAND=1",
+        "TROVE_RETENTION_DAYS=0",
+    ]
+
+
+def test_uninstall_mixed_ownership_does_not_partially_clean(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    hermes_home = tmp_path / "hermes-home"
+    foreign_skill = tmp_path / "foreign-skill"
+    foreign_skill.mkdir(parents=True)
+    plugin_target = hermes_home / "plugins" / "hermes-trove"
+    skill_target = hermes_home / "skills" / "hermes-trove"
+    plugin_target.parent.mkdir(parents=True)
+    skill_target.parent.mkdir(parents=True)
+    plugin_target.symlink_to(repo_root, target_is_directory=True)
+    skill_target.symlink_to(foreign_skill, target_is_directory=True)
+    config = hermes_home / "config.yaml"
+    config.write_text(
+        "plugins:\n  enabled:\n    - hermes-trove\ncontext:\n  engine: trove\n",
+        encoding="utf-8",
+    )
+    env_file = hermes_home / ".env"
+    env_file.write_text("TROVE_ENABLE_SLASH_COMMAND=1\n", encoding="utf-8")
+
+    subprocess.run(
+        ["bash", str(repo_root / "scripts" / "uninstall.sh")],
+        cwd=repo_root,
+        env={**os.environ, "HERMES_HOME": str(hermes_home), "PATH": "/usr/bin:/bin"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert plugin_target.is_symlink()
+    assert skill_target.is_symlink()
+    assert "- hermes-trove" in config.read_text(encoding="utf-8")
+    assert "TROVE_ENABLE_SLASH_COMMAND=1" in env_file.read_text(encoding="utf-8")
+
+
+def test_validate_release_checks_uninstall_shell_syntax():
+    script = (Path(__file__).resolve().parent.parent / "scripts" / "validate_release.sh").read_text()
+    assert "scripts/uninstall.sh" in script
+
+
+def test_update_script_resolves_physical_repo_root():
+    script = (Path(__file__).resolve().parent.parent / "scripts" / "update.sh").read_text()
+    assert 'pwd -P' in script
+
+
 def test_uninstall_removes_only_trove_owned_env_settings(tmp_path):
     repo_root = Path(__file__).resolve().parent.parent
     hermes_home = tmp_path / "hermes-home"
