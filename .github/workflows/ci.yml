@@ -101,5 +101,6 @@ jobs:
           python scripts/validate_dependency_contract.py
           python -m compileall -q .
           python -m py_compile scripts/import_lossless_claw.py
+          python scripts/trove_release_smoke.py
           bash -n scripts/install.sh scripts/update.sh
           git diff --check

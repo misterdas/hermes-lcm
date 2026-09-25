@@ -23,6 +23,7 @@ Default smoke mode runs the local gates that should be cheap enough for routine 
 - Python compile checks for the plugin and release scripts
 - shell syntax checks for maintained shell scripts
 - focused pytest coverage for core, command, packaging, benchmark, and stress surfaces
+- deterministic release persistence smoke: fresh database → ingest → DAG summary → FTS → deterministic semantic recall → shutdown → reopen
 - deterministic benchmark smoke with a synthetic fixture
 - deterministic stress smoke
 
@@ -67,6 +68,7 @@ The checklist is safe to paste into a release note or PR validation section afte
 - [ ] Python compile checks passed
 - [ ] shell syntax checks passed
 - [ ] focused or full pytest passed
+- [ ] release persistence smoke passed
 - [ ] deterministic benchmark smoke passed
 - [ ] deterministic stress smoke/release passed
 - [ ] git status before/after validation reviewed
