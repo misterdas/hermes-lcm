@@ -23,3 +23,7 @@ provides_hooks:
   - post_llm_call
   - subagent_start
   - subagent_stop
+# TROVE manages its own interpreter/venv (sidecar pattern, installed via
+# scripts/install.sh). Its pyproject.toml is tooling-only (no [project] table),
+# so Hermes PM must not copy it into the lock workspace or `uv lock` fails.
+python_runtime: external
