@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -1455,3 +1458,203 @@ def test_disabled_and_missing_profile_refuse_cleanly(tmp_path):
     assert "status: refused" in result
     assert "no current embedding profile" in result
     assert "/trove embed warmup" in result
+
+
+# --- production incident 2026-09-25: slash-invoked apply outlived the request ---
+#
+# A `/trove embed backfill --corpus chunks --apply` over 196 chunks ran ~7
+# batches. The host killed the slash request at its ~30s timeout, mid-batch, so
+# the `finally` that releases the lease and the in-flight claims never ran.
+# Result: 32 chunks stranded in `dispatched`, a lease held for the full 10-minute
+# TTL, and every retry refused with no explanation.
+
+
+def test_lease_records_owner_pid_so_a_crashed_run_is_identifiable(tmp_path):
+    db_path = tmp_path / "lease-pid.db"
+    store = VectorStore(db_path)
+    try:
+        conn = store.connection
+        command_mod._ensure_inflight_table(conn)
+        lease = command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0, now=1_000.0
+        )
+        assert lease is not None
+        raw = conn.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (command_mod._EMBEDDING_BACKFILL_CLAIM_KEY,),
+        ).fetchone()[0]
+        assert command_mod._embedding_lease_owner_pid(raw) == os.getpid()
+        assert command_mod._embedding_lease_owner_is_dead(raw) is False
+    finally:
+        store.close()
+
+
+def test_dead_owner_lease_is_stealable_before_ttl_expiry(tmp_path):
+    """The core fix: a killed holder must not block retries for a whole TTL."""
+    db_path = tmp_path / "lease-dead.db"
+    store = VectorStore(db_path)
+    try:
+        conn = store.connection
+        command_mod._ensure_inflight_table(conn)
+        # A lease whose owner pid cannot be running: claim a real one, then
+        # rewrite the recorded pid to a pid that has certainly exited.
+        lease = command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0, now=1_000.0
+        )
+        assert lease is not None
+        dead_pid = _definitely_dead_pid()
+        payload = json.loads(
+            conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (command_mod._EMBEDDING_BACKFILL_CLAIM_KEY,),
+            ).fetchone()[0]
+        )
+        payload["owner_pid"] = dead_pid
+        conn.execute(
+            "UPDATE metadata SET value = ? WHERE key = ?",
+            (json.dumps(payload, sort_keys=True), command_mod._EMBEDDING_BACKFILL_CLAIM_KEY),
+        )
+        conn.commit()
+
+        # Well inside the TTL — a second worker used to be refused here.
+        stolen = command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0, now=1_010.0
+        )
+        assert stolen is not None, "dead owner's lease must be stealable immediately"
+        assert stolen.generation == payload["generation"] + 1
+        # The original owner can no longer renew or act.
+        assert lease.renew(now=1_020.0, force=True) is False
+    finally:
+        store.close()
+
+
+def test_live_owner_lease_still_blocks_takeover(tmp_path):
+    """The safety half: never steal from a process that is still running."""
+    db_path = tmp_path / "lease-live.db"
+    store = VectorStore(db_path)
+    try:
+        conn = store.connection
+        command_mod._ensure_inflight_table(conn)
+        command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0, now=1_000.0
+        )
+        # Our own pid is recorded and alive, so the TTL still governs.
+        assert command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0, now=1_100.0
+        ) is None
+    finally:
+        store.close()
+
+
+def test_lease_without_owner_pid_is_not_stolen(monkeypatch, tmp_path):
+    """A lease written by an older build has no pid — the TTL must still govern."""
+    db_path = tmp_path / "lease-nopid.db"
+    store = VectorStore(db_path)
+    try:
+        conn = store.connection
+        command_mod._ensure_inflight_table(conn)
+        legacy = json.dumps(
+            {"owner": "legacy", "generation": 3, "heartbeat_at": 1_000.0}, sort_keys=True
+        )
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?)",
+            (command_mod._EMBEDDING_BACKFILL_CLAIM_KEY, legacy),
+        )
+        conn.commit()
+        assert command_mod._embedding_lease_owner_is_dead(legacy) is False
+        assert command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0, now=1_100.0
+        ) is None
+    finally:
+        store.close()
+
+
+def test_embed_status_reports_a_stale_lease_as_stealable(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    _seed(engine, 1)
+    store = VectorStore(engine._store.db_path)
+    try:
+        conn = store.connection
+        command_mod._ensure_inflight_table(conn)
+        payload = json.dumps(
+            {
+                "owner": "dead-one",
+                "generation": 1,
+                "heartbeat_at": time.time(),
+                "owner_pid": _definitely_dead_pid(),
+            },
+            sort_keys=True,
+        )
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (command_mod._EMBEDDING_BACKFILL_CLAIM_KEY, payload),
+        )
+        conn.commit()
+    finally:
+        store.close()
+
+    result = handle_trove_command("embed status", engine)
+    assert "backfill_lease: STALE" in result
+    assert "next run will steal it" in result
+
+
+def test_backfill_budget_defaults_below_the_slash_request_timeout(monkeypatch):
+    """An unbounded apply is what got SIGKILLed mid-batch in production."""
+    monkeypatch.delenv("TROVE_EMBEDDING_BACKFILL_BUDGET_S", raising=False)
+    budget = command_mod._embedding_backfill_budget_s()
+    assert 0 < budget < 30.0, (
+        "default budget must leave headroom under the ~30s slash timeout so the "
+        "run stops between batches instead of being killed"
+    )
+
+
+def test_explicit_budget_env_wins_and_zero_opts_into_unbounded(monkeypatch):
+    monkeypatch.setenv("TROVE_EMBEDDING_BACKFILL_BUDGET_S", "5")
+    assert command_mod._embedding_backfill_budget_s() == 5.0
+    monkeypatch.setenv("TROVE_EMBEDDING_BACKFILL_BUDGET_S", "0")
+    assert command_mod._embedding_backfill_budget_s() == 0.0
+
+
+def test_read_connection_falls_back_when_readonly_cannot_recover_the_wal(monkeypatch, tmp_path):
+    """`mode=ro` raised SQLITE_IOERR under concurrent writers; rw must recover."""
+    db_path = tmp_path / "wal.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE t(x)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    conn.commit()
+    conn.close()
+
+    real_connect = sqlite3.connect
+    state = {"calls": 0}
+
+    def flaky_connect(target, *args, **kwargs):
+        state["calls"] += 1
+        if kwargs.get("uri") and "mode=ro" in str(target):
+            # Simulate a WAL database that a read-only handle cannot recover.
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(command_mod.sqlite3, "connect", flaky_connect)
+    recovered = command_mod._embedding_read_connection(db_path)
+    try:
+        assert state["calls"] == 2, "must try ro first, then fall back to rw"
+        assert recovered.execute("SELECT count(*) FROM t").fetchone()[0] == 1
+    finally:
+        recovered.close()
+
+
+def test_read_connection_still_refuses_to_create_a_missing_database(monkeypatch, tmp_path):
+    missing = tmp_path / "nope.db"
+    monkeypatch.delenv("TROVE_EMBEDDING_BACKFILL_BUDGET_S", raising=False)
+    with pytest.raises(sqlite3.Error):
+        command_mod._embedding_read_connection(missing)
+    assert not missing.exists(), "a dry run must never create the database file"
+
+
+def _definitely_dead_pid() -> int:
+    """Return a pid that is not running: spawn a child, reap it, reuse its pid."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    assert proc.returncode == 0
+    return proc.pid

@@ -9,6 +9,7 @@ from pathlib import Path
 import contextlib
 import dataclasses
 import json
+import logging
 import math
 import os
 import re
@@ -86,9 +87,17 @@ from .tokens import count_tokens
 from .vector_store import EmbeddingIdentity, EmbeddingPublishOutcome, VectorStore
 
 
+logger = logging.getLogger(__name__)
+
 _EMBEDDING_BACKFILL_CLAIM_KEY = "trove_embedding_backfill_claim"
 _EMBEDDING_BACKFILL_CLAIM_TTL_S = 10 * 60
 _EMBEDDING_BACKFILL_BATCH_SIZE = 32
+# Default per-invocation wall-clock budget. A Hermes slash command is killed at
+# ~30s, so an apply that runs unbounded is terminated mid-batch and strands its
+# claims plus the lease until their TTLs expire. 20s leaves room for the report
+# and the host's own teardown; the run stops between batches and reports
+# `partial`, and the next invocation resumes where it left off.
+_EMBEDDING_BACKFILL_DEFAULT_BUDGET_S = 20.0
 
 
 def _env_float(key: str, default: float) -> float:
@@ -117,7 +126,19 @@ def _embedding_backfill_heartbeat_s() -> float:
 def _embedding_backfill_budget_s() -> float:
     # Operation-wide wall-clock budget (0 = unlimited). When exceeded the run
     # stops between batches and reports partial rather than running unbounded.
-    return _env_float("TROVE_EMBEDDING_BACKFILL_BUDGET_S", 0.0)
+    #
+    # A slash command runs under the host's request timeout (Hermes: ~30s). An
+    # unbounded apply over a corpus larger than that budget is not merely slow —
+    # the host SIGKILLs it mid-batch, which strands the in-flight claims and the
+    # lease until their TTLs expire. So when no explicit budget is configured,
+    # derive one that leaves headroom under the request timeout and stop cleanly
+    # between batches instead. Set the env var to 0 to opt back into unbounded.
+    explicit = _env_float("TROVE_EMBEDDING_BACKFILL_BUDGET_S", 0.0)
+    if explicit > 0:
+        return explicit
+    if os.environ.get("TROVE_EMBEDDING_BACKFILL_BUDGET_S") is not None:
+        return 0.0
+    return _EMBEDDING_BACKFILL_DEFAULT_BUDGET_S
 
 
 def _ensure_inflight_table(conn: sqlite3.Connection) -> None:
@@ -473,6 +494,11 @@ def _help_text(error: str | None = None) -> str:
         "- /trove preset apply <name> --dry-run: preview env-var changes without mutating live config",
         "- /trove embed warmup: download/probe the configured embedding model and register its dimension",
         "- /trove embed backfill [--apply] [--limit N]: preview or populate missing leaf-summary embeddings",
+        "- /trove embed backfill --corpus chunks [--apply] [--limit N]: the same for the raw-history chunk corpus",
+        "    NOTE: a slash command runs under the host's request timeout (~30s). An --apply over",
+        "    more chunks than fit is killed mid-run and leaves the rest pending. Bounded retries",
+        "    (--limit 20, repeated) always complete; or set TROVE_EMBEDDING_BACKFILL_BUDGET_S=20 so",
+        "    each run stops cleanly between batches and reports partial.",
         "- /trove embed status: show whether embeddings are enabled, the active profile, lease state, and vector coverage (read-only)",
         "- /trove help: show this help",
     ])
@@ -3148,7 +3174,18 @@ def _embedding_status_text(engine) -> str:
                 or 0.0
             )
             remaining = ttl_s - (time.time() - heartbeat_at)
-            if remaining > 0:
+            owner_pid = _embedding_lease_owner_pid(str(claim_row[0]))
+            owner_dead = _embedding_lease_owner_is_dead(str(claim_row[0]))
+            if remaining > 0 and owner_dead:
+                # The holder is gone without releasing (killed mid-run). Say so:
+                # the next backfill steals it immediately rather than waiting
+                # out the remaining TTL.
+                lines.append(
+                    f"backfill_lease: STALE (holder {holder} pid {owner_pid} is gone, "
+                    f"generation {generation}, {remaining:.1f}s of TTL left; "
+                    f"next run will steal it)"
+                )
+            elif remaining > 0:
                 lines.append(
                     f"backfill_lease: held by {holder} "
                     f"(generation {generation}, "
@@ -3318,11 +3355,33 @@ def _embedding_warmup_text(engine) -> str:
 
 
 def _embedding_read_connection(db_path: str | Path) -> sqlite3.Connection:
-    """Open the existing database without allowing a dry run to create it."""
-    uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Open the existing database without allowing a dry run to create it.
+
+    A WAL database cannot be recovered through a pure read-only handle: SQLite
+    needs write access to the ``-shm`` index to read the WAL, and under
+    concurrent writers a ``mode=ro`` full scan of the messages table fails with
+    ``SQLITE_IOERR`` (surfaced as "disk I/O error"). Rather than reporting a
+    spurious refusal, fall back to a read-write handle that still cannot create
+    the file (``mode=rw``), so dry runs stay non-creating but survive contention.
+    """
+    resolved = Path(db_path).resolve()
+    last_error: sqlite3.Error | None = None
+    for mode in ("ro", "rw"):
+        try:
+            conn = sqlite3.connect(f"{resolved.as_uri()}?mode={mode}", uri=True, timeout=5.0)
+        except sqlite3.Error as exc:
+            last_error = exc
+            continue
+        conn.row_factory = sqlite3.Row
+        try:
+            # Prove the handle can actually read the WAL, not just open.
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except sqlite3.Error as exc:
+            conn.close()
+            last_error = exc
+            continue
+        return conn
+    raise last_error if last_error is not None else sqlite3.OperationalError("cannot open database")
 
 
 def _embedding_current_profile(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -3509,6 +3568,54 @@ def _embedding_estimated_cost(provider: str, model: str, tokens: int) -> float:
     return (max(0, tokens) / 1_000_000.0) * rate
 
 
+def _embedding_lease_owner_pid(raw: str) -> int | None:
+    """Return the pid recorded on a lease, or None when absent/unreadable."""
+    try:
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            pid = payload.get("owner_pid")
+            if isinstance(pid, int) and pid > 0:
+                return pid
+        return None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _embedding_lease_generation(raw: str) -> int:
+    try:
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            return int(payload.get("generation", 0) or 0)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return 0
+
+
+def _embedding_lease_owner_is_dead(raw: str) -> bool:
+    """True only when we can positively prove the lease owner is gone.
+
+    Fails safe in every ambiguous case: a lease with no recorded pid (written
+    by an older build), an unparseable payload, or a pid whose liveness cannot
+    be determined all report False, so the TTL still governs and two runs
+    never embed concurrently on a guess.
+    """
+    pid = _embedding_lease_owner_pid(raw)
+    if pid is None:
+        return False
+    if pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        # Alive but owned by another user: not ours to judge.
+        return False
+    except OSError:
+        return False
+    return False
+
+
 def _embedding_lease_heartbeat(raw: str) -> float:
     try:
         payload = json.loads(raw)
@@ -3574,6 +3681,12 @@ class _BackfillLease:
                 "owner": self.lease_id,
                 "generation": self.generation,
                 "heartbeat_at": heartbeat_at,
+                # Recorded so a later acquirer can tell a crashed run from a
+                # live one. A lease released in a `finally` never needs this,
+                # but a SIGKILL (host request timeout, OOM) skips every cleanup
+                # path and leaves the row to expire on its own — a full TTL
+                # during which every retry is refused.
+                "owner_pid": os.getpid(),
             },
             sort_keys=True,
         )
@@ -3633,9 +3746,20 @@ def _acquire_embedding_backfill_lease(
         ).fetchone()
         if row is not None:
             heartbeat_at = _embedding_lease_heartbeat(str(row[0]))
-            if (now - heartbeat_at) < ttl_s:
+            if (now - heartbeat_at) < ttl_s and not _embedding_lease_owner_is_dead(str(row[0])):
                 conn.rollback()
                 return None
+            if (now - heartbeat_at) < ttl_s:
+                # Live TTL but the recorded owner is gone: it died without
+                # releasing (SIGKILL, request timeout). Steal it now instead of
+                # refusing every caller for the rest of the TTL.
+                logger.warning(
+                    "stealing embedding backfill lease from dead owner pid %s "
+                    "(generation %s, heartbeat %.1fs ago)",
+                    _embedding_lease_owner_pid(str(row[0])),
+                    _embedding_lease_generation(str(row[0])),
+                    now - heartbeat_at,
+                )
             try:
                 prior = json.loads(str(row[0]))
                 generation = int(prior.get("generation", 0) or 0) + 1
