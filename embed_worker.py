@@ -119,18 +119,22 @@ class _EmbedAutoBackfillScheduler:
                 return
             self._in_flight = True
 
+        has_more = False
         try:
-            self._do_auto_backfill(engine)
+            has_more = self._do_auto_backfill(engine)
         except Exception as exc:  # noqa: BLE001 — background worker, log and move on
             logger.debug("TROVE auto-backfill error: %s", exc)
         finally:
             with self._lock:
                 self._in_flight = False
+        if has_more:
+            self.schedule_auto_backfill(engine)
 
-    def _do_auto_backfill(self, engine: Any) -> None:
-        """Actually do the work: check pending, acquire lease, run one batch."""
+    def _do_auto_backfill(self, engine: Any) -> bool | None:
+        """Run one bounded batch; return whether more work remains."""
         config = engine._config
         db_path = engine._store.db_path
+        has_more = False
 
         # --- Fast path: check pending count (read-only, cheap, no lock) ---
         try:
@@ -263,6 +267,7 @@ class _EmbedAutoBackfillScheduler:
                         generation=lease.generation,
                     )
 
+                has_more = pending > len(accepted_indexes)
                 logger.debug(
                     "TROVE auto-backfill: embedded %d documents (pending: %d)",
                     len(accepted_indexes),
@@ -272,6 +277,7 @@ class _EmbedAutoBackfillScheduler:
                 lease.release()
         finally:
             store.close()
+        return has_more
 
     def shutdown(self) -> None:
         """Stop accepting new debounces.

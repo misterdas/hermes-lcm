@@ -168,6 +168,50 @@ def test_runs_one_batch_when_pending_and_lease_free(tmp_path, monkeypatch):
     assert _claim_value(engine) is None
 
 
+def test_successful_batch_rearms_when_more_than_one_batch_is_pending(tmp_path, monkeypatch):
+    """A successful bounded batch must schedule the next batch for the same engine."""
+    engine = _engine(tmp_path, auto_backfill=True)
+    _seed(engine, worker_mod._EMBEDDING_BACKFILL_BATCH_SIZE + 1)
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **kw: provider)
+
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = True
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    scheduler = _fresh_scheduler()
+    monkeypatch.setattr(worker_mod, "_EMBED_AUTO_BACKFILL_SCHEDULER", scheduler)
+    monkeypatch.setattr(worker_mod.threading, "Timer", FakeTimer)
+
+    scheduler._run_auto_backfill(engine)
+
+    assert [len(call) for call in provider.calls] == [
+        worker_mod._EMBEDDING_BACKFILL_BATCH_SIZE
+    ]
+    assert len(_meta_ids(engine)) == worker_mod._EMBEDDING_BACKFILL_BATCH_SIZE
+    assert len(timers) == 1
+    assert timers[0].args == (engine,)
+
+    timers[0].function(*timers[0].args)
+    assert [len(call) for call in provider.calls] == [
+        worker_mod._EMBEDDING_BACKFILL_BATCH_SIZE,
+        1,
+    ]
+    assert len(_meta_ids(engine)) == worker_mod._EMBEDDING_BACKFILL_BATCH_SIZE + 1
+
+
 def test_disable_flag_disables_it(tmp_path, monkeypatch):
     """When embed_auto_backfill_enabled=False, schedule_auto_backfill is a no-op."""
     engine = _engine(tmp_path, enabled=True, auto_backfill=False)
