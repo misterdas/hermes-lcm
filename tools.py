@@ -6245,6 +6245,60 @@ def _temporal_rollups_status(engine: "TROVEEngine") -> dict[str, Any]:
     return payload
 
 
+def _maintenance_health_status(engine: "TROVEEngine") -> dict[str, Any]:
+    """Return bounded, read-only maintenance debt across enabled subsystems."""
+    result: dict[str, Any] = {
+        "status": "pass",
+        "rollups": {},
+        "embedding_backfill": {},
+    }
+    conn = engine._store.connection
+    if conn is None:
+        result["status"] = "warn"
+        result["error"] = "TROVE store connection is not initialized"
+        return result
+
+    try:
+        rollup_rows = conn.execute(
+            "SELECT status, COUNT(*) FROM trove_rollups GROUP BY status"
+        ).fetchall()
+        rollup_counts = {str(status): int(count or 0) for status, count in rollup_rows}
+        result["rollups"] = rollup_counts
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            result["rollups_error"] = type(exc).__name__
+            result["status"] = "warn"
+    except sqlite3.Error as exc:
+        result["rollups_error"] = type(exc).__name__
+        result["status"] = "warn"
+
+    try:
+        inflight = conn.execute(
+            "SELECT state, COUNT(*) FROM trove_embedding_backfill_inflight GROUP BY state"
+        ).fetchall()
+        inflight_counts = {str(state): int(count or 0) for state, count in inflight}
+        result["embedding_backfill"] = inflight_counts
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            result["embedding_backfill_error"] = type(exc).__name__
+            result["status"] = "warn"
+    except sqlite3.Error as exc:
+        result["embedding_backfill_error"] = type(exc).__name__
+        result["status"] = "warn"
+
+    debt = sum(
+        int(result["rollups"].get(state, 0) or 0)
+        for state in ("stale", "building", "failed")
+    ) + sum(
+        int(result["embedding_backfill"].get(state, 0) or 0)
+        for state in ("claimed", "dispatched", "uncertain")
+    )
+    if debt or "rollups_error" in result or "embedding_backfill_error" in result:
+        result["status"] = "warn"
+    result["debt_count"] = debt
+    return result
+
+
 def trove_inspect(args: Dict[str, Any], **kwargs) -> str:
     """Return a read-only metadata inventory of the current TROVE session."""
     engine = _require_engine(kwargs)
@@ -6903,7 +6957,22 @@ def trove_doctor(args: Dict[str, Any], **kwargs) -> str:
             "detail": str(e),
         })
 
-    # 7. Context pressure
+    # 7. Maintenance debt across rollups and optional embedding backfill.
+    try:
+        maintenance_health = _maintenance_health_status(engine)
+        checks.append({
+            "check": "maintenance_health",
+            "status": maintenance_health["status"],
+            "detail": maintenance_health,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "maintenance_health",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    # 8. Context pressure
     if engine.context_length > 0:
         usage_pct = round(engine.last_prompt_tokens / engine.context_length * 100, 1) if engine.context_length else 0
         runtime_threshold = float(getattr(engine, "context_threshold", c.context_threshold))
@@ -6914,7 +6983,7 @@ def trove_doctor(args: Dict[str, Any], **kwargs) -> str:
             "detail": f"{usage_pct}% used, compaction triggers at {threshold_pct}%",
         })
 
-    # 8. PII-redaction-plus-backup guardrail (read-only security finding).
+    # 9. PII-redaction-plus-backup guardrail (read-only security finding).
     #    Surfaces a warning when redaction is OFF and trove.db lives inside
     #    HERMES_HOME — the tree the Hermes backup channel ships to a remote
     #    repo. The finding is evidence; it never flips defaults or changes

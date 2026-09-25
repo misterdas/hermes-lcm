@@ -92,6 +92,33 @@ def test_engine_shutdown_is_idempotent(tmp_path):
     engine.shutdown()
     engine.shutdown()
     assert engine._lifecycle_state == "shutdown"
+def test_maintenance_health_reports_rollup_debt_and_embedding_inflight(tmp_path):
+    from hermes_trove.tools import _maintenance_health_status
+
+    engine = TROVEEngine(
+        config=TROVEConfig(
+            database_path=str(tmp_path / "maintenance.db"),
+            temporal_rollups_enabled=True,
+        ),
+        hermes_home=str(tmp_path / "home"),
+    )
+    try:
+        conn = engine._dag.connection
+        conn.execute(
+            "INSERT INTO trove_rollups(period_kind, period_start, scope, status) "
+            "VALUES ('day', '2026-01-01', 'test', 'stale')"
+        )
+        conn.execute(
+            "CREATE TABLE trove_embedding_backfill_inflight (state TEXT)"
+        )
+        conn.execute("INSERT INTO trove_embedding_backfill_inflight(state) VALUES ('uncertain')")
+        conn.commit()
+        result = _maintenance_health_status(engine)
+        assert result["status"] == "warn"
+        assert result["rollups"]["stale"] == 1
+        assert result["embedding_backfill"]["uncertain"] == 1
+    finally:
+        engine.shutdown()
 
 
 @pytest.mark.parametrize(
