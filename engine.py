@@ -428,6 +428,8 @@ class TROVEEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySes
         self._assertion_extraction_last_error = ""
         self._assertion_extraction_last_model = ""
 
+        self._lifecycle_lock = threading.RLock()
+        self._lifecycle_state = "running"
         db_path = self._resolve_db_path(effective_home)
         self._bind_storage(db_path, effective_home)
 
@@ -6879,19 +6881,24 @@ class TROVEEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySes
     # -- Lifecycle ---------------------------------------------------------
 
     def shutdown(self):
-        try:
-            from .embed_worker import shutdown_auto_backfill
+        with self._lifecycle_lock:
+            if self._lifecycle_state == "shutdown":
+                return
+            self._lifecycle_state = "stopping"
+            try:
+                from .embed_worker import shutdown_auto_backfill
 
-            shutdown_auto_backfill()
-        except Exception as exc:  # noqa: BLE001 — shutdown must still close stores
-            logger.debug("TROVE auto-backfill shutdown error: %s", exc)
-        self._unregister_active_engine_binding()
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.close()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
-        if self._assertions is not None:
-            self._assertions.close()
-        if self._query_views is not None:
-            self._query_views.close()
+                shutdown_auto_backfill()
+            except Exception as exc:  # noqa: BLE001 — shutdown must still close stores
+                logger.debug("TROVE auto-backfill shutdown error: %s", exc)
+            self._unregister_active_engine_binding()
+            if self._adaptive_retrieval is not None:
+                self._adaptive_retrieval.close()
+            self._store.close()
+            self._dag.close()
+            self._lifecycle.close()
+            if self._assertions is not None:
+                self._assertions.close()
+            if self._query_views is not None:
+                self._query_views.close()
+            self._lifecycle_state = "shutdown"

@@ -3,7 +3,9 @@ import time
 
 import pytest
 
+from hermes_trove.config import TROVEConfig
 from hermes_trove.dag import SummaryDAG
+from hermes_trove.engine import TROVEEngine
 from hermes_trove.lifecycle_state import LifecycleStateStore
 from hermes_trove.query_view_store import QueryViewStore
 from hermes_trove.rollup_store import RollupStore
@@ -42,6 +44,16 @@ def test_query_view_store_nested_transaction_failure_rolls_back_only_inner_work(
         assert [row[0] for row in rows] == [1]
     finally:
         store.close()
+
+
+def test_engine_shutdown_is_idempotent(tmp_path):
+    engine = TROVEEngine(
+        config=TROVEConfig(database_path=str(tmp_path / "lifecycle.db")),
+        hermes_home=str(tmp_path / "home"),
+    )
+    engine.shutdown()
+    engine.shutdown()
+    assert engine._lifecycle_state == "shutdown"
 
 
 @pytest.mark.parametrize(
