@@ -119,6 +119,30 @@ def test_maintenance_health_reports_rollup_debt_and_embedding_inflight(tmp_path)
         assert result["embedding_backfill"]["uncertain"] == 1
     finally:
         engine.shutdown()
+def test_recovery_degradation_metrics_use_existing_engine_counters(tmp_path):
+    from hermes_trove.tools import _recovery_degradation_metrics
+
+    engine = TROVEEngine(
+        config=TROVEConfig(database_path=str(tmp_path / "metrics.db")),
+        hermes_home=str(tmp_path / "home"),
+    )
+    try:
+        engine._ingest_failure_count = 3
+        engine._consecutive_ingest_failures = 1
+        engine._proactive_recall_injected_count = 2
+        engine._proactive_recall_skipped_count = 4
+        engine._proactive_recall_timeout_count = 5
+        result = _recovery_degradation_metrics(engine)
+        assert result["ingest"]["total_failures"] == 3
+        assert result["ingest"]["consecutive_failures"] == 1
+        assert result["proactive_recall"] == {
+            "injected": 2,
+            "skipped": 4,
+            "timeouts": 5,
+        }
+        assert result["maintenance"]["debt_count"] == 0
+    finally:
+        engine.shutdown()
 
 
 @pytest.mark.parametrize(

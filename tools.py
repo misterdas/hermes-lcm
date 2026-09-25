@@ -6299,6 +6299,24 @@ def _maintenance_health_status(engine: "TROVEEngine") -> dict[str, Any]:
     return result
 
 
+def _recovery_degradation_metrics(engine: "TROVEEngine") -> dict[str, Any]:
+    """Expose existing recovery/degradation counters without new mutable state."""
+    return {
+        "ingest": {
+            "total_failures": int(getattr(engine, "_ingest_failure_count", 0) or 0),
+            "consecutive_failures": int(
+                getattr(engine, "_consecutive_ingest_failures", 0) or 0
+            ),
+        },
+        "proactive_recall": {
+            "injected": int(getattr(engine, "_proactive_recall_injected_count", 0) or 0),
+            "skipped": int(getattr(engine, "_proactive_recall_skipped_count", 0) or 0),
+            "timeouts": int(getattr(engine, "_proactive_recall_timeout_count", 0) or 0),
+        },
+        "maintenance": _maintenance_health_status(engine),
+    }
+
+
 def trove_inspect(args: Dict[str, Any], **kwargs) -> str:
     """Return a read-only metadata inventory of the current TROVE session."""
     engine = _require_engine(kwargs)
@@ -6972,7 +6990,26 @@ def trove_doctor(args: Dict[str, Any], **kwargs) -> str:
             "detail": str(e),
         })
 
-    # 8. Context pressure
+    # 8. Existing recovery and degradation counters.
+    try:
+        recovery_metrics = _recovery_degradation_metrics(engine)
+        checks.append({
+            "check": "recovery_degradation",
+            "status": "warn" if (
+                recovery_metrics["ingest"]["consecutive_failures"]
+                or recovery_metrics["maintenance"].get("status") == "warn"
+                or recovery_metrics["proactive_recall"]["timeouts"]
+            ) else "pass",
+            "detail": recovery_metrics,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "recovery_degradation",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    # 9. Context pressure
     if engine.context_length > 0:
         usage_pct = round(engine.last_prompt_tokens / engine.context_length * 100, 1) if engine.context_length else 0
         runtime_threshold = float(getattr(engine, "context_threshold", c.context_threshold))
@@ -6983,7 +7020,7 @@ def trove_doctor(args: Dict[str, Any], **kwargs) -> str:
             "detail": f"{usage_pct}% used, compaction triggers at {threshold_pct}%",
         })
 
-    # 9. PII-redaction-plus-backup guardrail (read-only security finding).
+    # 10. PII-redaction-plus-backup guardrail (read-only security finding).
     #    Surfaces a warning when redaction is OFF and trove.db lives inside
     #    HERMES_HOME — the tree the Hermes backup channel ships to a remote
     #    repo. The finding is evidence; it never flips defaults or changes
