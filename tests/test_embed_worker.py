@@ -227,6 +227,39 @@ def test_debounce_coalesces_burst(tmp_path, monkeypatch):
     assert len(canceled_timers) == 4
 
 
+def test_debounce_does_not_cancel_another_engines_pending_work(tmp_path, monkeypatch):
+    """Each engine gets its own debounce timer instead of last-writer-wins."""
+    engine_a = _engine(tmp_path / "a", enabled=True, auto_backfill=True)
+    engine_b = _engine(tmp_path / "b", enabled=True, auto_backfill=True)
+    scheduler = _fresh_scheduler()
+    timer_started = []
+
+    class FakeTimer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = True
+            self._canceled = False
+            timer_started.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self._canceled = True
+
+    monkeypatch.setattr(worker_mod.threading, "Timer", FakeTimer)
+    scheduler.schedule_auto_backfill(engine_a)
+    scheduler.schedule_auto_backfill(engine_b)
+
+    assert len(timer_started) == 2
+    assert not timer_started[0]._canceled
+    assert not timer_started[1]._canceled
+    assert timer_started[0].args == (engine_a,)
+    assert timer_started[1].args == (engine_b,)
+
+
 def test_shutdown_aborts_in_flight_safely(tmp_path, monkeypatch):
     """After shutdown, no new runs are scheduled; in-flight ones abandon cleanly."""
     engine = _engine(tmp_path, enabled=True, auto_backfill=True)

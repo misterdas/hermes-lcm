@@ -54,6 +54,10 @@ class _EmbedAutoBackfillScheduler:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        # One debounce timer per engine prevents a busy profile from cancelling
+        # another profile's pending auto-backfill. The worker remains serialized
+        # by _in_flight and the existing database lease.
+        self._timers: dict[int, threading.Timer] = {}
         self._timer: Optional[threading.Timer] = None
         self._in_flight = False
         self._shutdown = False
@@ -77,30 +81,41 @@ class _EmbedAutoBackfillScheduler:
         if debounce_s <= 0:
             debounce_s = 30.0
 
+        engine_key = id(engine)
         with self._lock:
             if self._shutdown:
                 return
-            if self._timer is not None:
-                self._timer.cancel()
-            self._timer = threading.Timer(
+            previous = self._timers.get(engine_key)
+            if previous is not None:
+                previous.cancel()
+            timer = threading.Timer(
                 debounce_s, self._run_auto_backfill, args=(engine,)
             )
-            self._timer.daemon = True
-            self._timer.start()
+            self._timers[engine_key] = timer
+            # Keep the legacy single-timer attribute for diagnostics/tests; it
+            # represents the most recently scheduled engine, not the queue.
+            self._timer = timer
+            timer.daemon = True
+            timer.start()
 
     def _run_auto_backfill(self, engine: Any) -> None:
         """Run one bounded batch of pending embeddings."""
+        engine_key = id(engine)
         with self._lock:
             if self._shutdown:
                 return
+            if self._timers.get(engine_key) is not None:
+                self._timers.pop(engine_key, None)
             if self._in_flight:
-                # A previous run is still going; reschedule briefly so we
-                # pick up any remaining work once it finishes.
-                self._timer = threading.Timer(
+                # A previous run is still going; reschedule this engine briefly
+                # so its remaining work is not lost behind the other profile.
+                timer = threading.Timer(
                     5.0, self._run_auto_backfill, args=(engine,)
                 )
-                self._timer.daemon = True
-                self._timer.start()
+                self._timers[engine_key] = timer
+                self._timer = timer
+                timer.daemon = True
+                timer.start()
                 return
             self._in_flight = True
 
@@ -267,9 +282,10 @@ class _EmbedAutoBackfillScheduler:
         """
         with self._lock:
             self._shutdown = True
-            if self._timer is not None:
-                self._timer.cancel()
-                self._timer = None
+            for timer in self._timers.values():
+                timer.cancel()
+            self._timers.clear()
+            self._timer = None
 
 
 # Process-wide scheduler instance. There is one per Hermes process, shared
