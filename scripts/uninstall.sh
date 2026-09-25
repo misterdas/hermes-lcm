@@ -14,6 +14,7 @@ fi
 PLUGIN_TARGET="$TARGET_ROOT/plugins/hermes-trove"
 SKILL_TARGET="$TARGET_ROOT/skills/hermes-trove"
 CONFIG="$TARGET_ROOT/config.yaml"
+ENV_FILE="$TARGET_ROOT/.env"
 
 removed=false
 foreign_checkout=false
@@ -85,6 +86,18 @@ else:
   else
     echo "config cleanup requires PyYAML; left $CONFIG unchanged"
   fi
+fi
+
+# Remove Trove-owned environment defaults
+if [[ -f "$ENV_FILE" && "$foreign_checkout" == "false" ]]; then
+  env_tmp="${ENV_FILE}.trovetmp"
+  awk '
+    /^TROVE_ENABLE_SLASH_COMMAND=/ { next }
+    /^TROVE_RETENTION_DAYS=/ { next }
+    { print }
+  ' "$ENV_FILE" > "$env_tmp"
+  mv "$env_tmp" "$ENV_FILE"
+  echo "Removed Trove settings from $ENV_FILE"
 fi
 
 if [[ "$removed" == "false" ]]; then

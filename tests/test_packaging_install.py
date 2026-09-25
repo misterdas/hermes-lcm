@@ -292,6 +292,35 @@ def test_install_script_creates_profile_aware_symlink_and_prints_activation_step
     assert str(skill_target) in result.stdout
 
 
+def test_uninstall_removes_only_trove_owned_env_settings(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    hermes_home = tmp_path / "hermes-home"
+    plugin_target = hermes_home / "plugins" / "hermes-trove"
+    skill_target = hermes_home / "skills" / "hermes-trove"
+    plugin_target.parent.mkdir(parents=True)
+    skill_target.parent.mkdir(parents=True)
+    plugin_target.symlink_to(repo_root, target_is_directory=True)
+    skill_target.symlink_to(repo_root / "skills" / "hermes-trove", target_is_directory=True)
+    env_file = hermes_home / ".env"
+    env_file.write_text(
+        "OTHER_SETTING=keep\n"
+        "TROVE_ENABLE_SLASH_COMMAND=1\n"
+        "TROVE_RETENTION_DAYS=0\n",
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        ["bash", str(repo_root / "scripts" / "uninstall.sh")],
+        cwd=repo_root,
+        env={**os.environ, "HERMES_HOME": str(hermes_home)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert env_file.read_text(encoding="utf-8") == "OTHER_SETTING=keep\n"
+
+
 def test_uninstall_preserves_config_for_foreign_checkout(tmp_path):
     repo_root = Path(__file__).resolve().parent.parent
     hermes_home = tmp_path / "hermes-home"
