@@ -5707,11 +5707,11 @@ class TestSessionFiltering:
         scan = _scan_retention_candidates(instance)
         assert scan["error"] is None
         # Foreground row surfaces; cron's empty session is not the scan
-        # target. protected is False because the bound id is cron, not the
-        # row we are reporting on.
+        # target. The foreground remains protected while cron temporarily owns
+        # engine._session_id.
         assert scan["sessions_analyzed"] == 1
         assert scan["sessions"][0]["session_id"] == "telegram-foreground"
-        assert scan["sessions"][0]["protected"] is False
+        assert scan["sessions"][0]["protected"] is True
 
     def test_foreground_view_advances_when_a_real_foreground_arrives(self, tmp_path):
         """``_foreground_session_id`` advances forward through real foreground

@@ -208,6 +208,23 @@ def test_retention_apply_protects_live_session(tmp_path):
     assert remaining == 2
 
 
+def test_retention_apply_protects_lifecycle_current_session_when_runtime_id_is_stale(tmp_path):
+    """Retention must protect the active lifecycle session, not only _session_id."""
+    engine = _make_engine(tmp_path, retention_days=90, retention_apply_enabled=True)
+    engine._session_id = "stale-bound-session"
+    engine._foreground_session_id = "live-session"
+    engine._foreground_session_platform = "telegram"
+    _add_old_session(engine, "live-session", messages=2)
+
+    result = handle_trove_command("doctor retention apply", engine)
+
+    assert "eligible_sessions: 0" in result
+    remaining = engine._store.connection.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = 'live-session'"
+    ).fetchone()[0]
+    assert remaining == 2
+
+
 def test_retention_apply_refuses_pinned_sessions(tmp_path):
     engine = _make_engine(tmp_path, retention_days=90, retention_apply_enabled=True)
     _add_old_session(engine, "old-pinned", messages=3, pinned=True)

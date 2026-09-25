@@ -745,7 +745,10 @@ def _scan_retention_candidates(engine) -> dict[str, Any]:
         age_days = max(0.0, (now - last_activity_at) / 86400.0)
         # Bound (not foreground): protect the live session from retention
         # bookkeeping while the engine may still be writing to it.
-        protected = session_id == getattr(engine, "_session_id", "")
+        protected = session_id in {
+            str(getattr(engine, "_session_id", "") or ""),
+            str(getattr(engine, "current_session_id", "") or ""),
+        } - {""}
         total_footprint_tokens = int(token_total) + int(node_token_total)
         if protected:
             protected_count += 1
@@ -2037,7 +2040,10 @@ def _doctor_retention_apply_text(engine) -> str:
 
     from .retention import evaluate_retention, RetentionPinRefused
 
-    protected = {str(getattr(engine, "_session_id", "") or "")} - {""}
+    protected = {
+        str(getattr(engine, "_session_id", "") or ""),
+        str(getattr(engine, "current_session_id", "") or ""),
+    } - {""}
     # Re-scan ALL sessions for policy evaluation: retention is store-wide,
     # matching the store-wide read-only preview (`retention apply` scope ==
     # `doctor retention` scope so the operator previews what would be deleted).
@@ -2142,7 +2148,12 @@ def _delete_retention_candidates_atomically(engine, session_ids: set[str]) -> di
     ``trove_recall`` keeps finding the session through its summaries.
     """
     conn = engine._store.connection
-    protected_session_ids = {str(s) for s in {getattr(engine, "_session_id", "")} if s}
+    protected_session_ids = {
+        str(s) for s in {
+            getattr(engine, "_session_id", ""),
+            getattr(engine, "current_session_id", ""),
+        } if s
+    }
     session_ids = {str(s) for s in session_ids if s and str(s) not in protected_session_ids}
     if not session_ids:
         return {
