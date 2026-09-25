@@ -2,6 +2,24 @@
 
 This repo also publishes GitHub Releases. This file is the repo-root release surface for operators who want the recent release arc without leaving the checkout.
 
+## Unreleased
+
+## v1.2.1 - 2026-09-25
+
+### Fixed
+
+- Synchronize store shutdown with active writers so a close cannot close a shared SQLite connection underneath an in-flight operation.
+- Make `QueryViewStore` write transactions re-entrant using nested SQLite savepoints.
+- Make engine shutdown explicit and idempotent across repeated lifecycle calls.
+- Correct the release validator's stale stress-test path.
+
+### Added
+
+- Safe SQLite failure metadata: store, operation, database path, error class, SQLite code, and retryability — without SQL, parameters, or conversation content.
+- `trove_doctor` maintenance-health reporting for rollup and embedding-backfill debt.
+- `trove_doctor` recovery/degradation metrics for ingest failures, proactive recall, and maintenance debt.
+- Offline release persistence smoke covering ingest, DAG summary, FTS, deterministic semantic recall, shutdown, and reopen.
+
 ## v1.2.0 - 2026-09-24
 
 ### Added
