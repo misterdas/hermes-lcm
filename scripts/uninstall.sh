@@ -16,6 +16,7 @@ SKILL_TARGET="$TARGET_ROOT/skills/hermes-trove"
 CONFIG="$TARGET_ROOT/config.yaml"
 
 removed=false
+foreign_checkout=false
 
 # Remove plugin symlink
 if [[ -L "$PLUGIN_TARGET" ]]; then
@@ -25,6 +26,7 @@ if [[ -L "$PLUGIN_TARGET" ]]; then
     echo "Removed plugin symlink: $PLUGIN_TARGET"
     removed=true
   else
+    foreign_checkout=true
     echo "Skipping plugin symlink (points to $target, not $REPO_ROOT)" >&2
   fi
 elif [[ -e "$PLUGIN_TARGET" ]]; then
@@ -40,6 +42,7 @@ if [[ -L "$SKILL_TARGET" ]]; then
     echo "Removed skill symlink: $SKILL_TARGET"
     removed=true
   else
+    foreign_checkout=true
     echo "Skipping skill symlink (points to $target, not $expected)" >&2
   fi
 elif [[ -e "$SKILL_TARGET" ]]; then
@@ -47,7 +50,7 @@ elif [[ -e "$SKILL_TARGET" ]]; then
 fi
 
 # Remove hermes-trove sections from config.yaml
-if [[ -f "$CONFIG" ]]; then
+if [[ -f "$CONFIG" && "$foreign_checkout" == "false" ]]; then
   if python3 -c 'import yaml' >/dev/null 2>&1; then
     # Use Python to properly remove the YAML sections
     python3 -c "

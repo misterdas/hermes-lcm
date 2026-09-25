@@ -292,6 +292,42 @@ def test_install_script_creates_profile_aware_symlink_and_prints_activation_step
     assert str(skill_target) in result.stdout
 
 
+def test_uninstall_preserves_config_for_foreign_checkout(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    hermes_home = tmp_path / "hermes-home"
+    foreign_repo = tmp_path / "foreign-trove"
+    foreign_skill = foreign_repo / "skills" / "hermes-trove"
+    foreign_skill.mkdir(parents=True)
+    plugin_target = hermes_home / "plugins" / "hermes-trove"
+    skill_target = hermes_home / "skills" / "hermes-trove"
+    plugin_target.parent.mkdir(parents=True)
+    skill_target.parent.mkdir(parents=True)
+    plugin_target.symlink_to(foreign_repo, target_is_directory=True)
+    skill_target.symlink_to(foreign_skill, target_is_directory=True)
+    config = hermes_home / "config.yaml"
+    config.write_text(
+        "plugins:\n  enabled:\n    - hermes-trove\ncontext:\n  engine: trove\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(repo_root / "scripts" / "uninstall.sh")],
+        cwd=repo_root,
+        env={**os.environ, "HERMES_HOME": str(hermes_home), "PATH": "/usr/bin:/bin"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert plugin_target.is_symlink()
+    assert skill_target.is_symlink()
+    configured = config.read_text(encoding="utf-8")
+    assert "- hermes-trove" in configured
+    assert "engine: trove" in configured
+    assert "Skipping plugin symlink" in result.stderr
+    assert "Skipping skill symlink" in result.stderr
+
+
 def test_uninstall_survives_missing_yaml_dependency(tmp_path):
     repo_root = Path(__file__).resolve().parent.parent
     hermes_home = tmp_path / "hermes-home"
