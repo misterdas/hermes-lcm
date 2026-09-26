@@ -289,7 +289,10 @@ class _EmbedAutoBackfillScheduler:
                         generation=lease.generation,
                     )
 
-                has_more = pending > len(accepted_indexes)
+                # OR, never overwrite: the summary pass below reassigns
+                # `has_more`, which silently discarded a True here and stopped
+                # the re-arm loop even with a full chunk backlog pending.
+                has_more = has_more or pending > len(accepted_indexes)
                 logger.debug(
                     "TROVE auto-backfill: embedded %d documents (pending: %d)",
                     len(accepted_indexes),

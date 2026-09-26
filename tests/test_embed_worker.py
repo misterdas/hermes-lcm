@@ -449,3 +449,50 @@ def test_chunk_auto_backfill_reports_more_work(tmp_path, monkeypatch):
         command_mod, "_chunk_backfill_text", lambda *a, **k: "status: complete\nremaining: 0\n"
     )
     assert scheduler._do_auto_chunk_backfill(engine) is False
+
+
+def test_chunk_backlog_rearms_even_when_summary_pass_has_nothing_pending(
+    tmp_path, monkeypatch
+):
+    """A full CHUNK backlog must survive the summary pass and keep the loop alive.
+
+    The summary pass ran after the chunk pass and ASSIGNED `has_more`, so an
+    empty summary corpus overwrote the chunk pass's True. The scheduler saw
+    has_more=False, never re-armed, and the worker stopped after one 32-chunk
+    batch with thousands of chunks still waiting. The two passes must OR.
+    """
+    engine = _engine(tmp_path, enabled=True, auto_backfill=True, chunk_auto_backfill=True)
+    # One summary node: the summary pass embeds it and correctly computes
+    # has_more = (1 pending > 1 embedded) = False. That False is what used to
+    # clobber the chunk pass's True.
+    _seed(engine, 1)
+
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, interval, function, args=()):
+            self.interval, self.function, self.args = interval, function, args
+            self.daemon = True
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    scheduler = _fresh_scheduler()
+    monkeypatch.setattr(worker_mod, "_EMBED_AUTO_BACKFILL_SCHEDULER", scheduler)
+    monkeypatch.setattr(worker_mod.threading, "Timer", FakeTimer)
+    # Chunk pass: work remains. Summary pass: nothing pending at all.
+    monkeypatch.setattr(
+        command_mod, "_chunk_backfill_text", lambda *a, **k: "status: partial\nremaining: 42\n"
+    )
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **kw: provider)
+
+    scheduler._run_auto_backfill(engine)
+
+    # The re-arm timer must exist, or the chain dies with the chunk backlog open.
+    assert timers, "no re-arm timer: chunk backlog was discarded by the summary pass"
+    assert timers[0].args == (engine,)
