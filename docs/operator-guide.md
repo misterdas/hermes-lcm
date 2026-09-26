@@ -135,7 +135,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-trove v1.2.1 (15 tools)
+  ✓ hermes-trove v1.2.2 (15 tools)
 
 Provider Plugins:
   Context Engine: trove

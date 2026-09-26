@@ -4,6 +4,25 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+## v1.2.2 - 2026-09-26
+
+### Fixed
+
+- **Intra-process multi-writer corruption**: a process-wide write lock keyed by resolved database path, so `MessageStore` and a `VectorStore` opened by the background embedding worker serialize their write transactions instead of interleaving on one WAL.
+- **Writes to a damaged store**: the startup index self-heal now refuses to auto-repair page-level damage, and the write gate stays closed instead of letting new writes turn a partially-recoverable database into an unreadable one.
+- **POSIX `fcntl` lock stripping** in `_init_db`: closing any descriptor to the database inode silently released every POSIX record lock; lock-release work now runs before SQLite attaches, and `BEGIN IMMEDIATE` is used on append.
+- `mmap` is disabled by default — it corrupted a live multi-writer store on this host.
+- Doctor trusts only generated ingest references found inside parsed JSON values, never quoted legacy markers.
+- A killed backfill run no longer strands its lease.
+- Embed backfill treats a missing `remaining:` key as unknown rather than zero, keeps the chunk backlog alive when the summary pass has nothing pending, and makes every summary-pass exit explicit so a bail-out re-arms.
+- `/trove embed status` renders `last_backfill_at` in the system timezone. The column is still STORED in UTC; only the display converts.
+
+### Added
+
+- Opt-in background backfill for the chunk corpus (`TROVE_EMBED_CHUNK_AUTO_BACKFILL=1`), so verbatim recall stays current without a manual backfill after every session. The corpus is raw operator text, so it stays behind explicit consent.
+- `TROVE_EMBEDDING_THREADS` to cap fastembed/ONNX worker threads, so a backfill cannot saturate every core on a small host and starve the interactive turn.
+- `AGENTS.md`, the repo's developer guide.
+
 ## v1.2.1 - 2026-09-25
 
 ### Fixed
