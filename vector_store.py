@@ -28,6 +28,7 @@ from .config import TROVEConfig
 from .db_bootstrap import (
     SQLITE_BUSY_TIMEOUT_SECONDS,
     configure_connection,
+    process_write_lock,
     ensure_chunk_tables,
     ensure_embedding_tables,
     mark_migration_step_complete,
@@ -438,7 +439,14 @@ class VectorStore:
         # to its own savepoint and re-raises, leaving the earlier rows of the
         # batch intact for the outer COMMIT.
         try:
-            with self._write_lock, self._cache_lock:
+            # Serialize against EVERY other connection in this process, not
+            # just this instance: the background embedding worker owns its own
+            # VectorStore while the gateway's MessageStore keeps ingesting the
+            # same trove.db. Without the shared process-wide lock those two
+            # connections interleave their write transactions (the exact
+            # multi-writer pattern that corrupted a live store on 2026-09-25).
+            # Re-entrant like the per-instance lock, so nesting is safe.
+            with process_write_lock(self.db_path), self._write_lock, self._cache_lock:
                 if self._txn_depth > 0:
                     savepoint = f"trove_pub_sp_{self._txn_depth}"
                     self._conn.execute(f"SAVEPOINT {savepoint}")

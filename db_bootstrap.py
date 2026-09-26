@@ -334,6 +334,83 @@ def ensure_metadata_table(conn: sqlite3.Connection) -> None:
     )
 
 
+@contextmanager
+def write_transaction(
+    conn: sqlite3.Connection,
+    *,
+    budget_ms: int = SQLITE_BUSY_TIMEOUT_MS,
+):
+    """Run a body inside ``BEGIN IMMEDIATE`` with a bounded busy-retry.
+
+    Python's sqlite3 module opens transactions DEFERRED: the first statement
+    takes a SHARED lock, and the lock is upgraded to RESERVED/EXCLUSIVE only
+    at commit time. Under real cross-process contention - the gateway, the
+    desktop backend, a CLI session, and the background embedding worker all
+    writing the same trove.db - two writers can each hold a shared lock, both
+    attempt the upgrade, and the loser gets an un-retryable
+    ``database is locked`` partway through the statement. That is the classic
+    SQLITE_BUSY upgrade deadlock, and on the ingest path it aborts a message
+    append.
+
+    ``BEGIN IMMEDIATE`` takes the write lock up front, so contention is
+    resolved once, at transaction start, where SQLite's busy handler (and
+    this retry) can actually see it. The retry covers the remaining case where
+    another writer holds the file lock at BEGIN time, with bounded backoff so
+    a genuinely stuck process cannot spin forever.
+
+    ``SQLITE_FULL`` is surfaced immediately (never retried) and the
+    transaction is rolled back, so a disk-full event during a multi-row write
+    cannot leave a half-applied transaction behind.
+
+    Yields the connection for the caller to execute statements against; the
+    body is expected to call ``conn.commit()`` or ``conn.rollback()``, or
+    leave the decision to this context manager on exit.
+
+    If the connection is ALREADY inside a transaction (an outer caller began
+    one), this joins that transaction instead of raising: the existing
+    transaction already holds a lock, so re-issuing BEGIN would fail with
+    "cannot start a transaction within a transaction". The commit/rollback
+    responsibility stays with the outermost context in that case.
+    """
+    if getattr(conn, "in_transaction", False):
+        # Already inside a transaction: don't BEGIN again, and don't let this
+        # context own the commit/rollback.
+        yield conn
+        return
+    deadline = time.monotonic() + budget_ms / 1000.0
+    delay_seconds = 0.005
+    while True:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            break
+        except sqlite3.OperationalError as exc:
+            detail = str(exc).lower()
+            if "locked" not in detail and "busy" not in detail:
+                raise
+            if time.monotonic() >= deadline:
+                raise
+        time.sleep(delay_seconds)
+        delay_seconds = min(delay_seconds * 2, 0.25)
+    try:
+        yield conn
+    except sqlite3.OperationalError as exc:
+        # SQLITE_FULL ("database or disk is full") is never transient here;
+        # rolling back keeps a partial multi-row write from persisting.
+        if "full" in str(exc).lower():
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        raise
+    except BaseException:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+
+
 def get_schema_version(conn: sqlite3.Connection) -> int:
     ensure_metadata_table(conn)
     row = conn.execute(
