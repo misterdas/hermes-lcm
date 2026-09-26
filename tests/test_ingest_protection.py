@@ -2198,10 +2198,10 @@ def test_externalized_payload_integrity_scan_detects_embedded_tool_call_metadata
     engine = _engine(tmp_path)
     storage_dir = tmp_path / "externalized"
     storage_dir.mkdir()
-    (storage_dir / "present-tool-call-metadata-media.json").write_text(json.dumps({"content": "payload"}))
+    (storage_dir / "20260925_193001_media_payload_tool_calls_c38c2bf3055c_18d8a71964a1a.json").write_text(json.dumps({"content": "payload"}))
     placeholder = (
         "[Externalized TROVE ingest payload: kind=media_payload; field=tool_calls; "
-        "chars=1; bytes=1; ref=present-tool-call-metadata-media.json]"
+        "chars=1; bytes=1; ref=20260925_193001_media_payload_tool_calls_c38c2bf3055c_18d8a71964a1a.json]"
     )
     tool_calls = json.dumps(
         [
@@ -2426,10 +2426,10 @@ def test_externalized_payload_integrity_scan_detects_json_tool_call_argument_pla
     engine = _engine(tmp_path)
     storage_dir = tmp_path / "externalized"
     storage_dir.mkdir()
-    (storage_dir / "present-caption-tool-call-media.json").write_text(json.dumps({"content": "payload"}))
+    (storage_dir / "20260925_193002_media_payload_tool_calls_c38c2bf3055c_18d8a71964a1b.json").write_text(json.dumps({"content": "payload"}))
     placeholder = (
         "[Externalized TROVE ingest payload: kind=media_payload; field=tool_calls; "
-        "chars=1; bytes=1; ref=present-caption-tool-call-media.json]"
+        "chars=1; bytes=1; ref=20260925_193002_media_payload_tool_calls_c38c2bf3055c_18d8a71964a1b.json]"
     )
     arguments = json.dumps({"image": f'caption says "front" {placeholder}'})
     tool_calls = json.dumps(
@@ -2473,10 +2473,10 @@ def test_externalized_payload_integrity_scan_detects_json_tool_call_argument_pla
     engine = _engine(tmp_path)
     storage_dir = tmp_path / "externalized"
     storage_dir.mkdir()
-    (storage_dir / "present-unmatched-caption-tool-call-media.json").write_text(json.dumps({"content": "payload"}))
+    (storage_dir / "20260925_193003_media_payload_tool_calls_c38c2bf3055c_18d8a71964a1c.json").write_text(json.dumps({"content": "payload"}))
     placeholder = (
         "[Externalized TROVE ingest payload: kind=media_payload; field=tool_calls; "
-        "chars=1; bytes=1; ref=present-unmatched-caption-tool-call-media.json]"
+        "chars=1; bytes=1; ref=20260925_193003_media_payload_tool_calls_c38c2bf3055c_18d8a71964a1c.json]"
     )
     arguments = json.dumps({"image": f'caption says "front {placeholder}'})
     tool_calls = json.dumps(
@@ -2654,10 +2654,10 @@ def test_externalized_payload_integrity_scan_counts_real_refs_inside_tool_call_l
     engine = _engine(tmp_path)
     storage_dir = tmp_path / "externalized"
     storage_dir.mkdir()
-    (storage_dir / "20260625-real-tool-call-media.json").write_text(json.dumps({"content": "payload"}))
+    (storage_dir / "20260925_193004_media_payload_tool_calls_c38c2bf3055c_18d8a71964a1d.json").write_text(json.dumps({"content": "payload"}))
     placeholder = (
         "[Externalized TROVE ingest payload: kind=media_payload; field=tool_calls; "
-        "chars=1; bytes=1; ref=20260625-real-tool-call-media.json]"
+        "chars=1; bytes=1; ref=20260925_193004_media_payload_tool_calls_c38c2bf3055c_18d8a71964a1d.json]"
     )
     arguments = json.dumps({"log": f'pytest output: "prefix before placeholder {placeholder}"'})
     tool_calls = json.dumps(
