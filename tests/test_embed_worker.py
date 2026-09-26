@@ -540,3 +540,52 @@ def test_chunk_backlog_rearms_even_when_summary_pass_has_nothing_pending(
     # The re-arm timer must exist, or the chain dies with the chunk backlog open.
     assert timers, "no re-arm timer: chunk backlog was discarded by the summary pass"
     assert timers[0].args == (engine,)
+
+
+def test_summary_pass_bailouts_rearm_except_proven_empty(tmp_path, monkeypatch):
+    """A pass that could not check its corpus must re-arm; a proven-empty one must not.
+
+    Every ``return`` inside the summary pass used to return None, which is falsy,
+    so lease-held / database-unreadable / provider-missing / identity-changed
+    bails were indistinguishable from "corpus empty" and silently ended the
+    re-arm loop. The three exits that positively prove there is nothing to do
+    must still stop it, or the worker spins forever on a drained corpus.
+    """
+    engine = _engine(tmp_path, enabled=True, auto_backfill=True)
+    _seed(engine, 5)
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **kw: provider)
+
+    scheduler = _fresh_scheduler()
+    monkeypatch.setattr(worker_mod, "_EMBED_AUTO_BACKFILL_SCHEDULER", scheduler)
+
+    # --- transient: lease held by another backfill => must re-arm ---
+    conn = sqlite3.connect(engine._store.db_path)
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
+        (
+            command_mod._EMBEDDING_BACKFILL_CLAIM_KEY,
+            json.dumps({"owner": "someone-else", "claimed_at": time.time()}),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    assert scheduler._do_auto_backfill(engine) is True
+    # It did not embed anything, it just refused to call itself done.
+    assert provider.calls == []
+
+    conn = sqlite3.connect(engine._store.db_path)
+    conn.execute("DELETE FROM metadata WHERE key = ?", (command_mod._EMBEDDING_BACKFILL_CLAIM_KEY,))
+    conn.commit()
+    conn.close()
+
+    # --- proven empty: schema + profile exist but zero pending nodes ---
+    empty_engine = _engine(tmp_path / "empty", enabled=True, auto_backfill=True)
+    _seed(empty_engine, 0)
+    empty_provider = FakeProvider()
+    monkeypatch.setattr(
+        command_mod, "resolve_provider", lambda _config, **kw: empty_provider
+    )
+    assert scheduler._do_auto_backfill(empty_engine) is False
+    assert empty_provider.calls == []

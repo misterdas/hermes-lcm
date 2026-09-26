@@ -131,8 +131,18 @@ class _EmbedAutoBackfillScheduler:
         if has_more:
             self.schedule_auto_backfill(engine)
 
-    def _do_auto_backfill(self, engine: Any) -> bool | None:
-        """Run one bounded batch; return whether more work remains."""
+    def _do_auto_backfill(self, engine: Any) -> bool:
+        """Run one bounded batch of each corpus; return whether more work remains.
+
+        Returns True when EITHER corpus still has work, and also when a pass
+        could not determine its own state (lease held, database unreadable,
+        provider missing) — an unconfirmed pass must retry rather than be read
+        as "done". Only a pass that positively proves its corpus empty, or that
+        embeds everything it selected, returns False.
+
+        Every exit below is explicit for that reason: a bare ``return`` returns
+        None, which is falsy, which silently stopped the re-arm loop.
+        """
         config = engine._config
         db_path = engine._store.db_path
         has_more = False
@@ -163,13 +173,16 @@ class _EmbedAutoBackfillScheduler:
                 db_path=db_path,
                 logger_obj=logger,
             )
-            return
+            # Could not check the summary corpus. Retry; do not report "done".
+            return has_more or True
 
         try:
             profile = _embedding_current_profile(read_conn)
             if profile is None:
+                # Nothing is embeddable at all, so nothing can remain. The only
+                # exit that legitimately ends the loop on its own.
                 logger.debug("TROVE auto-backfill: no active profile")
-                return
+                return has_more
             identity = str(profile["identity_hash"])
             model = str(profile["model_name"])
             provider_name = str(profile["provider"])
@@ -180,8 +193,10 @@ class _EmbedAutoBackfillScheduler:
             read_conn.close()
 
         if pending == 0:
+            # Positively proven empty — the summary corpus is done. The chunk
+            # pass's own verdict (if any) still stands.
             logger.debug("TROVE auto-backfill: nothing pending")
-            return
+            return has_more
 
         # --- Slow path: open read-write connection and acquire lease ---
         store = VectorStore(db_path, config=config)
@@ -189,7 +204,7 @@ class _EmbedAutoBackfillScheduler:
         if rw_conn is None:
             logger.debug("TROVE auto-backfill: store connection is None")
             store.close()
-            return
+            return has_more or True
         try:
             _ensure_inflight_table(rw_conn)
 
@@ -199,15 +214,19 @@ class _EmbedAutoBackfillScheduler:
                 rw_conn, ttl_s=ttl_s, heartbeat_s=heartbeat_s
             )
             if lease is None:
+                # Someone else is embedding. Transient by definition — the lease
+                # holder finishes and the next debounce finds the work waiting.
                 logger.debug("TROVE auto-backfill: lease held, skipping")
-                return
+                return has_more or True
 
             try:
                 _prepare_inflight_for_lease(rw_conn, identity, lease)
                 captured_identity = store.capture_identity(model, provider=provider_name)
                 if captured_identity.identity_hash != identity:
+                    # Another worker re-warmed the profile between our two reads.
+                    # Our snapshot is stale; retry against the new identity.
                     logger.debug("TROVE auto-backfill: identity changed, aborting")
-                    return
+                    return has_more or True
 
                 # Re-query pending rows under the lease so the batch reflects
                 # the state at claim time, not a stale pre-claim snapshot.
@@ -216,7 +235,7 @@ class _EmbedAutoBackfillScheduler:
                 )
                 if pending == 0:
                     logger.debug("TROVE auto-backfill: nothing pending after lease")
-                    return
+                    return has_more
 
                 documents = [
                     (str(row["node_id"]), str(row["summary"]), count_tokens(row["summary"]))
@@ -225,14 +244,18 @@ class _EmbedAutoBackfillScheduler:
 
                 provider = command_mod.resolve_provider(config, for_backfill=True)
                 if provider is None:
+                    # Misconfiguration, not an empty corpus. Retrying costs one
+                    # cheap pending check and recovers as soon as it is fixed.
                     logger.debug("TROVE auto-backfill: provider not configured")
-                    return
+                    return has_more or True
                 if (
                     provider.model_id != model
                     or str(provider.provider_id).lower() != provider_name.lower()
                 ):
+                    # Same: the registered profile and the configured provider
+                    # disagree until the operator re-warms.
                     logger.debug("TROVE auto-backfill: provider mismatch")
-                    return
+                    return has_more or True
 
                 # Run one bounded batch through the existing machinery.
                 batch = documents[:_EMBEDDING_BACKFILL_BATCH_SIZE]
