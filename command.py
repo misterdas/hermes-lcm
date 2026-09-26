@@ -3234,7 +3234,18 @@ def _embedding_status_text(engine) -> str:
             chunk_pending = 0
         lines.append(f"chunk_pending: {chunk_pending}")
 
+        # ``embedded_at`` is STORED in UTC on purpose (one canonical value, no
+        # ambiguity across hosts), but this line is what the operator reads, so
+        # render it in the system timezone. ``fromisoformat`` parses the stored
+        # ``+00:00`` offset; ``astimezone()`` converts to local, so the printed
+        # time matches the host clock instead of reading hours early.
         last_at = _max_embedded_at(read_conn)
+        if last_at:
+            try:
+                last_at = datetime.fromisoformat(last_at).astimezone().isoformat()
+            except ValueError:
+                # Unparseable stored value: show it verbatim rather than hide it.
+                pass
         lines.append(f"last_backfill_at: {last_at or 'unknown'}")
 
         lines.append("status: ok")

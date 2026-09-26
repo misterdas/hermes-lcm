@@ -331,3 +331,56 @@ def test_embed_unknown_subcommand_still_errors(tmp_path):
     engine = _engine(tmp_path)
     result = handle_trove_command("embed bogus", engine)
     assert "warmup" in result or "backfill" in result or "status" in result
+
+
+def test_status_renders_last_backfill_at_in_system_timezone(tmp_path):
+    """`last_backfill_at` is STORED in UTC but must PRINT in the system timezone.
+
+    Regression: the raw `+00:00` string was printed verbatim, so an operator in
+    IST read a time 5h30m earlier than when the backfill actually ran.
+    """
+    from datetime import datetime
+
+    engine = _engine(tmp_path)
+    _seed(engine, 1)
+
+    # Run a real backfill so the meta row is written by the real publish path.
+    from hermes_trove.command import _embedding_backfill_summary_text
+
+    provider = FakeProvider(dim=2)
+    original = command_mod.resolve_provider
+    command_mod.resolve_provider = lambda *a, **k: provider
+    try:
+        _embedding_backfill_summary_text(
+            engine, apply=True, limit=10, retry_uncertain=False
+        )
+    finally:
+        command_mod.resolve_provider = original
+
+    # Pin a fixed UTC instant so the assertion does not depend on test timing.
+    store = VectorStore(engine._store.db_path, config=engine._config)
+    try:
+        stored = "2026-09-26T14:43:39.982685+00:00"
+        store.connection.execute(
+            "UPDATE trove_embedding_meta SET embedded_at = ?", (stored,)
+        )
+        store.connection.commit()
+    finally:
+        store.close()
+
+    result = handle_trove_command("embed status", engine)
+
+    line = next(
+        ln for ln in result.splitlines() if ln.startswith("last_backfill_at:")
+    )
+    shown = line.split(":", 1)[1].strip()
+    assert shown != "unknown", f"no timestamp surfaced: {line}"
+
+    parsed = datetime.fromisoformat(shown)
+    assert parsed.tzinfo is not None, f"timestamp lost its offset: {shown}"
+    # Same instant as stored, just rendered locally: compare aware datetimes.
+    assert parsed == datetime.fromisoformat(stored)
+    # And it must NOT still be the raw UTC wall-clock, or the fix is a no-op.
+    assert parsed.utcoffset() == datetime.now().astimezone().utcoffset(), (
+        f"not converted to system tz: {shown}"
+    )
