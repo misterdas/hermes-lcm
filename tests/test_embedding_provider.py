@@ -1351,3 +1351,63 @@ def test_voyage_rerank_empty_documents_short_circuits(monkeypatch):
 
     assert provider.rerank("q", [], timeout=5.0) == []
     assert transport.calls == []
+
+
+# --- TROVE_EMBEDDING_THREADS: fastembed/ONNX worker-thread cap ---------------
+#
+# A backfill must be able to run on ONE core so an interactive agent turn
+# running alongside it always has a free core. 0 (default) means "runtime
+# default" and must NOT pass a threads= kwarg at all: fastembed's own default
+# is None, and passing an explicit 0 is a different value, not the same.
+
+
+def _recorded_fastembed_kwargs(monkeypatch, threads: int):
+    """Build a FastembedProvider and return the kwargs its construct() passed on."""
+    captured: dict = {}
+
+    def fake_text_embedding(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(provider_mod, "_load_fastembed", lambda: fake_text_embedding)
+    provider = FastembedProvider(
+        "BAAI/bge-base-en-v1.5", cache_dir="/tmp/fe", threads=threads
+    )
+    provider._construct(allow_download=False)
+    return captured
+
+
+def test_embedding_threads_positive_value_is_passed_to_fastembed(monkeypatch):
+    captured = _recorded_fastembed_kwargs(monkeypatch, threads=1)
+    assert captured["threads"] == 1
+    assert captured["model_name"] == "BAAI/bge-base-en-v1.5"
+
+
+def test_embedding_threads_default_omits_kwarg_entirely(monkeypatch):
+    """0 must be ABSENT, not 0 — an explicit 0 is not fastembed's default."""
+    captured = _recorded_fastembed_kwargs(monkeypatch, threads=0)
+    assert "threads" not in captured
+
+
+def test_embedding_threads_negative_falls_back_to_default(monkeypatch):
+    """A nonsense negative value degrades to the runtime default, not a crash."""
+    captured = _recorded_fastembed_kwargs(monkeypatch, threads=-4)
+    assert "threads" not in captured
+
+
+def test_resolve_provider_threads_the_fastembed_provider(monkeypatch):
+    monkeypatch.setenv("TROVE_EMBEDDING_PROVIDER", "fastembed")
+    monkeypatch.setenv("TROVE_EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
+    monkeypatch.setenv("TROVE_EMBEDDING_THREADS", "1")
+    provider = resolve_provider(TROVEConfig.from_env())
+    assert isinstance(provider, FastembedProvider)
+    assert provider.threads == 1
+
+
+def test_resolve_provider_unset_threads_leaves_default(monkeypatch):
+    monkeypatch.delenv("TROVE_EMBEDDING_THREADS", raising=False)
+    monkeypatch.setenv("TROVE_EMBEDDING_PROVIDER", "fastembed")
+    monkeypatch.setenv("TROVE_EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
+    provider = resolve_provider(TROVEConfig.from_env())
+    assert isinstance(provider, FastembedProvider)
+    assert provider.threads == 0

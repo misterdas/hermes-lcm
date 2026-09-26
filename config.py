@@ -449,6 +449,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("embedding_content_policy", "TROVE_EMBED_CONTENT_POLICY", str),
     _EnvFieldSpec("ollama_base_url", "TROVE_OLLAMA_BASE_URL", str),
     _EnvFieldSpec("fastembed_cache_dir", "TROVE_FASTEMBED_CACHE_DIR", str),
+    _EnvFieldSpec("embedding_threads", "TROVE_EMBEDDING_THREADS", int),
     _EnvFieldSpec("embedding_query_timeout_s", "TROVE_EMBEDDING_QUERY_TIMEOUT_S", float),
     _EnvFieldSpec("recall_query_timeout_s", "TROVE_RECALL_QUERY_TIMEOUT_S", float),
     _EnvFieldSpec("embedding_backfill_timeout_s", "TROVE_EMBEDDING_BACKFILL_TIMEOUT_S", float),
@@ -782,6 +783,13 @@ class TROVEConfig:
     # cache dir so multiple local-model users share ONE model download
     # instead of each keeping their own copy.
     fastembed_cache_dir: str = ""
+    # fastembed/ONNX worker-thread cap. 0 (default) = let the runtime pick,
+    # which on a multi-core host saturates every core during a backfill and
+    # starves the agent turn running alongside it. Setting 1 keeps a backfill to
+    # a single core so an interactive turn always has a free one; the trade is
+    # wall-clock, not total CPU (measured: ~1.9x slower per batch on a 2-core
+    # box, same CPU-seconds). Ignore when the provider is not fastembed.
+    embedding_threads: int = 0
     embedding_query_timeout_s: float = 3.0
     # Dedicated deadline for trove_recall. It fans out three sequential arms (FTS +
     # summary KNN + chunk KNN) plus fusion, hydration, and an optional rerank, so

@@ -1529,6 +1529,7 @@ class FastembedProvider(_ResilientProvider):
         model: str,
         *,
         cache_dir: str | Path | None = None,
+        threads: int = 0,
         timeout: float = 3.0,
         breaker: EmbeddingCircuitBreaker | None = None,
         spend_guard: EmbeddingSpendGuard | None = None,
@@ -1538,6 +1539,11 @@ class FastembedProvider(_ResilientProvider):
         if not self._model_id:
             raise ValueError("FastEmbed embedding model must not be empty")
         self.cache_dir = Path(cache_dir) if cache_dir is not None else _DEFAULT_FASTEMBED_CACHE
+        # Cap the ONNX worker pool so a backfill cannot saturate every core on a
+        # small host and starve the interactive turn. 0 = runtime default. The cap
+        # is applied here, at construction, because fastembed builds the session
+        # once and reuses it; setting it per embed() call would be a no-op.
+        self.threads = int(threads) if int(threads) > 0 else 0
         self.timeout = float(timeout)
         self._model: Any = None
         self._dim = 0
@@ -1558,11 +1564,14 @@ class FastembedProvider(_ResilientProvider):
                 "FastEmbed is not installed; install the optional fastembed dependency"
             ) from exc
         try:
-            return text_embedding(
-                model_name=self.model_id,
-                cache_dir=str(self.cache_dir),
-                local_files_only=not allow_download,
-            )
+            kwargs: dict[str, Any] = {
+                "model_name": self.model_id,
+                "cache_dir": str(self.cache_dir),
+                "local_files_only": not allow_download,
+            }
+            if self.threads > 0:
+                kwargs["threads"] = self.threads
+            return text_embedding(**kwargs)
         except Exception as exc:
             if allow_download:
                 raise EmbeddingProviderError(
@@ -1746,8 +1755,13 @@ def resolve_provider(
         )
     if provider in {"fastembed", "fast-embed"}:
         cache_dir = getattr(config, "fastembed_cache_dir", "") or None
+        threads = int(getattr(config, "embedding_threads", 0) or 0)
         return FastembedProvider(
-            model, timeout=timeout, spend_guard=spend_guard, cache_dir=cache_dir
+            model,
+            timeout=timeout,
+            spend_guard=spend_guard,
+            cache_dir=cache_dir,
+            threads=threads,
         )
     raise ProviderUnavailable(
         f"Unsupported embedding provider {provider!r}; use voyage, ollama, or fastembed"

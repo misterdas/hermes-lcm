@@ -5705,7 +5705,11 @@ def handle_trove_command(raw_args: str | None, engine) -> str:
             return _embedding_status_text(engine)
         if rest and rest[0].lower() == "backfill":
             return _embedding_backfill_text(rest[1:], engine)
-        return _help_text("`/trove embed` requires the `warmup`, `status`, or `backfill` subcommand.")
+        return _help_text(
+            "`/trove embed` requires the `warmup`, `status`, or `backfill` subcommand.\n"
+            "Small host? set TROVE_EMBEDDING_THREADS=1 to cap a backfill to one core "
+            "so an interactive turn always has a free one."
+        )
 
     if head == "help":
         return _help_text()
