@@ -109,29 +109,36 @@ with open(out_path, "w") as fh:
 
 
 @pytest.mark.xfail(
-    strict=True,
+    # NON-strict: the SIGBUS is host-specific. On this aarch64 Oracle host
+    # ~1-in-4 workers crash at commit(), but on the GitHub CI runners (x86
+    # Linux) the same test PASSES. A strict marker would turn that healthy-CI
+    # pass into a red build. Non-strict means: pass where the write path is
+    # fine, silently-xfail where the known host bug bites, and it becomes a
+    # genuine signal once we drop the marker entirely after the fix lands.
     reason=(
-        "Known SIGBUS in the concurrent write path (store.py _insert_single commit). "
-        "4 concurrent writer processes crash ~1-in-4 at commit(); raw sqlite3 with the "
-        "same pragmas does not. Flip to a hard pass when the write path is fixed."
+        "Host-specific SIGBUS in the concurrent write path (store.py "
+        "_insert_single commit): reproduced on this aarch64 host with 4 "
+        "concurrent writer processes; raw sqlite3 with the same pragmas does "
+        "not crash. Remove the marker when the write path is fixed."
     ),
 )
 def test_multi_process_concurrent_appends_keep_store_intact(tmp_path: Path) -> None:
     """Concurrent writers from separate OS processes must not corrupt or lose data.
 
-    THIS IS THE REGRESSION GUARD for the 2026-09-25 corruption. It currently
-    FAILS on this host: with 4 concurrent writer processes, ~1 in 4 workers
-    dies with SIGBUS at ``MessageStore.append``'s ``commit()``
-    (store.py ``_insert_single``). A raw ``sqlite3`` connection configured with
-    the SAME pragmas (WAL + synchronous=FULL + mmap_size=0 + the FTS5
-    external-content insert trigger) does NOT crash under the identical
-    load, so the fault is in TROVE's write path, not the platform or SQLite
-    itself. It reproduces identically on ext4 and tmpfs.
+    THIS IS THE REGRESSION GUARD for the 2026-09-25 corruption. On this
+    aarch64 Oracle host it currently FAILS: with 4 concurrent writer
+    processes, ~1 in 4 workers dies with SIGBUS at ``MessageStore.append``'s
+    ``commit()`` (store.py ``_insert_single``). A raw ``sqlite3`` connection
+    configured with the SAME pragmas (WAL + synchronous=FULL + mmap_size=0 +
+    the FTS5 external-content insert trigger) does NOT crash under the
+    identical load, so the fault is in TROVE's write path, not the platform
+    or SQLite itself. It reproduces identically on ext4 and tmpfs.
 
-    Marked ``xfail(strict=True)`` pending the root-cause fix: the assertion
-    below documents the intended contract, and flipping this marker to a hard
-    pass is the signal that the SIGBUS write-path bug is resolved. Everything
-    else in this file (the harness) is proven working.
+    The crash is host-specific: the same test PASSES on the x86 GitHub CI
+    runners. Hence a non-strict ``xfail`` — see the marker below. The
+    harness itself is proven working (runs in ~4s) and the assertions encode
+    the intended contract; removing the marker after the write-path fix is
+    the signal that the SIGBUS bug is resolved.
     """
     from hermes_trove.store import MessageStore  # seed/migrate the db once
 
