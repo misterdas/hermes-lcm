@@ -16,6 +16,7 @@ import os
 import sqlite3
 import stat
 import threading
+from contextlib import contextmanager
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,7 @@ from .db_bootstrap import (
     configure_connection,
     ensure_external_content_fts,
     is_fts_corruption_error,
+    process_write_lock,
     refuse_schema_version_too_new,
     repair_external_content_fts,
     run_message_identity_migration,
@@ -349,6 +351,16 @@ def build_message_fts_spec() -> ExternalContentFtsSpec:
     )
 
 
+class StoreWriteBlocked(RuntimeError):
+    """Raised when a write is attempted against a structurally damaged store.
+
+    The startup integrity check refuses to auto-repair page-level b-tree
+    damage, and writing into a damaged b-tree makes recovery strictly worse.
+    Reads, search, and the doctor keep working so the operator can inspect and
+    restore; only ingestion stops.
+    """
+
+
 class MessageStore:
     """SQLite-backed immutable message store."""
 
@@ -377,7 +389,39 @@ class MessageStore:
         # change semantics for single-threaded callers and adds only a single
         # uncontended ``RLock.acquire``/``release`` pair per operation.
         self._write_lock = threading.RLock()
+        # Set by the startup write gate in _init_db when the store is
+        # structurally damaged; None means writable.
+        self._write_blocked_detail: Optional[list[str]] = None
+        self._process_lock: Optional[threading.RLock] = None
         self._init_db()
+
+    @contextmanager
+    def write_guard(self):
+        """Serialize a write transaction and refuse it if the store is damaged.
+
+        Wraps the per-instance lock AND the process-wide lock for this
+        database path, so a second connection in this process (the background
+        embedding worker) cannot interleave a write transaction with this
+        store's. Raises :class:`StoreWriteBlocked` when the startup integrity
+        check found structural damage that could not be healed.
+
+        Write call sites use this instead of ``with self._write_lock:``. The
+        inner per-instance lock is still taken (this acquires it), so existing
+        re-entrant call patterns keep working unchanged.
+        """
+        detail = self._write_blocked_detail
+        if detail:
+            raise StoreWriteBlocked(
+                f"TROVE store {self.db_path} is structurally damaged and is "
+                f"read-only until repaired: {detail[0]}"
+            )
+        with self._write_lock:
+            lock = self._process_lock
+            if lock is None:
+                yield
+                return
+            with lock:
+                yield
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS, check_same_thread=False)
@@ -409,6 +453,26 @@ class MessageStore:
                     self._conn.commit()
                 except sqlite3.Error:
                     pass
+            # Startup write gate (t4): page-level/structural damage is never
+            # auto-repaired, but writing INTO a damaged b-tree turns a
+            # recoverable "some rows are unreachable" into an unreadable
+            # database. On 2026-09-25 a store damaged this way kept accepting
+            # writes for hours and the tail of the message table was lost
+            # before anyone noticed. Arm a write block so the operator gets a
+            # clear, loud failure (and the doctor still runs) instead of
+            # silent, compounding loss.
+            if heal.get("details") and not heal.get("healed"):
+                self._write_blocked_detail = list(heal["details"])[:5]
+                logger.error(
+                    "TROVE REFUSING TO WRITE to a structurally damaged store: %s "
+                    "(%d integrity failures). Reads and the doctor still work; "
+                    "repair or restore the database before ingesting again.",
+                    self.db_path,
+                    len(heal["details"]),
+                )
+            # Shared process-wide lock: a second connection in this process
+            # (the embedding worker) must serialize against this one.
+            self._process_lock = process_write_lock(self.db_path)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -446,6 +510,19 @@ class MessageStore:
             self._conn,
             build_message_fts_spec(),
         )
+        if self._write_blocked_detail:
+            # The store is structurally damaged, so the startup write gate is
+            # armed (see _init_db). Skip every migration/column-ensure step:
+            # they are all writes, they would raise "database disk image is
+            # malformed" on the damaged tree, and crashing here would take the
+            # whole store offline - including the reads and /trove doctor that
+            # the operator needs to inspect and restore it. The schema is
+            # already present on disk; leaving it untouched is correct.
+            logger.warning(
+                "TROVE skipping schema migrations on a damaged store so reads and "
+                "the doctor stay available (schema left as-is on disk).",
+            )
+            return
         run_versioned_migrations(self._conn)
         self._ensure_source_column()
         self._ensure_conversation_id_column()
@@ -641,7 +718,7 @@ class MessageStore:
             self._conn.commit()
             return store_id
 
-        with self._write_lock:
+        with self.write_guard():
             try:
                 return _insert_single()
             except sqlite3.DatabaseError as exc:
@@ -723,7 +800,7 @@ class MessageStore:
                     )
             return batch_ids
 
-        with self._write_lock:
+        with self.write_guard():
             try:
                 return _execute_batch()
             except sqlite3.DatabaseError as exc:
@@ -744,7 +821,7 @@ class MessageStore:
         """Move all persisted messages from one session_id to another."""
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
-        with self._write_lock:
+        with self.write_guard():
             cur = self._conn.execute(
                 "UPDATE messages SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
@@ -754,7 +831,7 @@ class MessageStore:
 
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
-        with self._write_lock:
+        with self.write_guard():
             cur = self._conn.execute(
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
@@ -779,7 +856,7 @@ class MessageStore:
         later batch archive would slice the new (short) content at the old chunk
         offsets, returning a garbled fragment (F2).
         """
-        with self._write_lock:
+        with self.write_guard():
             row = self._conn.execute(
                 "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
                 (store_id,),
@@ -808,14 +885,14 @@ class MessageStore:
     def pin(self, store_id: int) -> None:
 
         """Mark a message as pinned (protected from pruning)."""
-        with self._write_lock:
+        with self.write_guard():
             self._conn.execute(
                 "UPDATE messages SET pinned = 1 WHERE store_id = ?", (store_id,)
             )
             self._conn.commit()
 
     def unpin(self, store_id: int) -> None:
-        with self._write_lock:
+        with self.write_guard():
             self._conn.execute(
                 "UPDATE messages SET pinned = 0 WHERE store_id = ?", (store_id,)
             )
@@ -1263,7 +1340,7 @@ class MessageStore:
         """Normalize legacy NULL/blank source rows to the explicit unknown bucket."""
         stats_before = self.get_source_stats()
         blank_clause = _legacy_blank_source_clause("source")
-        with self._write_lock, self._conn:
+        with self.write_guard(), self._conn:
             cur = self._conn.execute(
                 f"UPDATE messages SET source = ? WHERE {blank_clause}",
                 (_UNKNOWN_SOURCE,),
@@ -1332,7 +1409,7 @@ class MessageStore:
         if conn is None:
             return False
         wrote = False
-        with self._write_lock:
+        with self.write_guard():
             for key in keys:
                 if skip_unchanged:
                     existing = conn.execute(
@@ -1390,7 +1467,7 @@ class MessageStore:
             return None
 
         key = self._compaction_telemetry_key(conversation_id)
-        with self._write_lock:
+        with self.write_guard():
             try:
                 # Separate MessageStore instances have separate Python locks.
                 # Acquire SQLite's write reservation before reading so this
@@ -1963,7 +2040,7 @@ class MessageStore:
     # -- Lifecycle ----------------------------------------------------------
 
     def close(self) -> None:
-        with self._write_lock:
+        with self.write_guard():
             conn = getattr(self, "_conn", None)
             if conn:
                 # Graceful shutdown hygiene: checkpoint committed WAL frames before

@@ -844,6 +844,37 @@ after 10 minutes. Provider calls occur before per-row SQLite writes, and each
 row is committed independently, so one malformed row does not roll back the
 rest of a successful provider batch.
 
+#### Running a large backfill safely
+
+A `--apply` run over a large corpus writes for a long time while the gateway
+keeps ingesting. Two rules keep that safe, and both exist because a live store
+was lost to this exact shape on 2026-09-25:
+
+- **Always back up `trove.db` first** (`cp trove.db trove.db.pre-backfill.bak`).
+  A backfill is the highest-volume write TROVE does; a pre-run copy is the
+  only cheap way back.
+- **Drive backfills through `/trove`, not a hand-rolled script.** A script that
+  opens `trove.db` directly and constructs its own `VectorStore`/`MessageStore`
+  bypasses the store's write discipline and reintroduces the multi-writer
+  corruption the plugin now prevents. The supported command runs inside the
+  gateway process, so its writes serialize against ingestion.
+
+If a run is interrupted, leave it: apply mode is resume-safe and a crashed
+claim is taken over after 10 minutes. Killing the process mid-batch is
+survivable; running a second writer alongside it is not.
+
+#### If the store is damaged
+
+TROVE runs a full `PRAGMA integrity_check` on every open. Index-only damage
+is self-healed in place. **Page-level/structural damage is never
+auto-repaired** — the store opens read-only and logs
+`TROVE REFUSING TO WRITE to a structurally damaged store`, and any write
+attempt raises `StoreWriteBlocked`. That is intentional: writing into a
+damaged b-tree converts a partially-recoverable database into an unreadable
+one. Reads, search, and `/trove doctor` keep working so you can inspect and
+restore. Back up the file, then restore it or repair it out of band; do not
+work around the block by ingesting anyway.
+
 Voyage authentication failures abort immediately because later batches would
 fail the same way. Transient provider failures are reported for the affected
 rows and later batches continue; rerun the command to retry anything still
