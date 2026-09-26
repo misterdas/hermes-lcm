@@ -1659,6 +1659,30 @@ def _looks_like_example_payload_ref(ref: str) -> bool:
     return name.startswith(("example-", "example_", "fake-", "fake_", "dummy-", "dummy_", "placeholder-", "placeholder_"))
 
 
+# Exact filename shape minted by externalize.externalize_ingest_payload:
+#   {YYYYMMDD}_{HHMMSS}_{kind_stub}_{field_stub}_{digest12}_{time_ns_hex}.json
+#
+# A captured test fixture, patch, or doc snippet that quotes a marker cannot
+# forge all five segments, so a marker embedded inside a multi-line document
+# value is only trusted when its ref matches this shape or when the whole
+# value is the placeholder. Fixture-style names (missing-tool-call-media.json,
+# real-media.json, payload.json) are suppressed.
+_GENERATED_EXTERNALIZED_REF_RE = re.compile(
+    r"^[0-9]{8}_[0-9]{6}_[A-Za-z0-9_.-]*_[A-Za-z0-9_.-]*_[0-9a-f]{6,}_[0-9a-f]{4,}\.json$"
+)
+
+
+def is_generated_externalized_ref(ref: str) -> bool:
+    """True when *ref* has the exact filename shape TROVE's externalizer mints.
+
+    Intentionally strict: a hand-restored payload or a ref from before the
+    current naming scheme will not match and is treated as unverified.
+    """
+    if not isinstance(ref, str):
+        return False
+    return _GENERATED_EXTERNALIZED_REF_RE.match(ref.strip()) is not None
+
+
 def _is_value_boundary_placeholder(text: str, start: int, end: int) -> bool:
     """True when the placeholder occupies the whole trimmed string value.
 
@@ -1698,6 +1722,16 @@ def _extract_document_value_externalized_payload_refs(text: str) -> list[str]:
     because a real ingest reference legitimately sits mid-value - in a caption,
     a log line, or tool-call metadata.
 
+    However, a string value inside a parsed JSON document that is itself a
+    multi-line blob (a captured pytest result, a patch payload, a doc snippet,
+    or a test-function source string) has no field= provenance tying the
+    embedded marker to TROVE's writer. In that context an embedded ingest
+    marker is only trusted when its ref has the exact shape TROVE's
+    externalizer mints (a five-segment date-prefixed filename) or when the
+    whole trimmed value is the placeholder. Any other ref shape - a fixture
+    name like ``real-media.json``, a doc example, a hand-written test ref -
+    is quoted example text and is suppressed.
+
     The legacy ``GC'd externalized tool output`` marker gets one extra rule: it
     only counts when it spans the whole trimmed value. The same marker text
     embedded mid-value is quoted example content (a patch payload, a test
@@ -1722,6 +1756,13 @@ def _extract_document_value_externalized_payload_refs(text: str) -> list[str]:
             )
         ):
             continue
+        if not is_generated_externalized_ref(ref):
+            # Multi-line document value with no field= provenance: only trust
+            # refs TROVE's externalizer actually mints. A fixture-style name
+            # (missing-tool-call-media.json, real-media.json, payload.json)
+            # embedded in a captured test snippet or patch is example text.
+            if not _is_value_boundary_placeholder(text, match.start(), match.end()):
+                continue
         _append_unique_refs(refs, [ref])
     for match in _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE.finditer(text):
         ref = match.group(1).strip()

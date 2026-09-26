@@ -92,20 +92,54 @@ def test_whole_value_legacy_marker_in_tool_call_argument_is_still_a_live_ref():
 
 
 def test_ingest_placeholder_mid_value_is_still_a_live_ref():
-    """Ingest markers have field= provenance, so mid-value placement is trusted."""
+    """Ingest markers have field= provenance, so mid-value placement is trusted.
+
+    The ref must have the shape TROVE's externalizer mints (a five-segment
+    date-prefixed filename). Fixture-style names like ``real-media.json``
+    are quoted example text and are no longer treated as live refs.
+    """
     tool_calls = json.dumps(
         [
             {
                 "function": {
                     "name": "analyze_image",
-                    "arguments": json.dumps({"image": "caption says hi [Externalized TROVE ingest payload: kind=media_payload; field=tool_calls; chars=1; bytes=1; ref=real-media.json]"}),
+                    "arguments": json.dumps(
+                        {
+                            "image": "caption says hi "
+                            "[Externalized TROVE ingest payload: kind=media_payload; field=tool_calls; "
+                            "chars=1; bytes=1; ref=20260925_193005_media_payload_tool_calls_c38c2bf3055c_18d8a71964a1e.json]"
+                        }
+                    ),
                 }
             }
         ]
     )
     assert _refs_for_externalized_integrity_scan(
         tool_calls, role="assistant", field="tool_calls"
-    ) == ["real-media.json"]
+    ) == [
+        "20260925_193005_media_payload_tool_calls_c38c2bf3055c_18d8a71964a1e.json"
+    ]
+
+
+def test_ingest_placeholder_mid_value_with_fixture_ref_is_not_a_live_ref():
+    """A fixture-style ref name mid-value inside a JSON doc is quoted example text."""
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "analyze_image",
+                    "arguments": json.dumps(
+                        {
+                            "image": "caption says hi [Externalized TROVE ingest payload: kind=media_payload; field=tool_calls; chars=1; bytes=1; ref=real-media.json]"
+                        }
+                    ),
+                }
+            }
+        ]
+    )
+    assert _refs_for_externalized_integrity_scan(
+        tool_calls, role="assistant", field="tool_calls"
+    ) == []
 
 
 def _payload(*, session_id: str = "old-session", content: str = "stored output") -> dict:
