@@ -18,6 +18,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,49 @@ def _is_sqlite_lock_error(exc: BaseException) -> bool:
                 return True
         current = current.__cause__ or current.__context__
     return False
+
+
+# --- Process-wide write serialization (t4) -----------------------------------
+#
+# A single TROVE process can hold SEVERAL independent connections to the same
+# trove.db: MessageStore's own connection, plus a VectorStore opened by the
+# background embedding worker (embed_worker._do_auto_backfill) while the
+# gateway's main store is still ingesting. Per-instance locks do not help -
+# each connection guards only itself, so the worker's writes never contend
+# with the store's.
+#
+# That multi-writer pattern inside one process is what corrupted a live store
+# on 2026-09-25: the background worker held a read-write connection open
+# ACROSS the embedding provider's network round-trips (seconds to minutes)
+# while the main store kept committing WAL frames. Long-lived interleaved
+# read-write handles on one WAL file diverge the B-tree, which is the
+# "database disk image is malformed" / "file is not a database" class this
+# project has now hit three times.
+#
+# A process-wide lock keyed by resolved database path makes every connection
+# in this process serialize its write transactions against every other. It
+# does NOT protect against other PROCESSES (SQLite's own file locking plus
+# busy_timeout handles that, one writer at a time), but it removes the
+# intra-process case that has no file-lock coverage at all.
+_PROCESS_WRITE_LOCKS: dict[str, threading.RLock] = {}
+_PROCESS_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def process_write_lock(db_path: "os.PathLike[str] | str") -> threading.RLock:
+    """Return the process-wide write lock for *db_path*.
+
+    One lock per resolved database path, created on first use. Callers must
+    hold it for the duration of a write transaction, and must NOT hold it
+    across a blocking network call - that reintroduces the exact stall the
+    lock exists to prevent.
+    """
+    key = str(Path(db_path).expanduser().resolve())
+    with _PROCESS_WRITE_LOCKS_GUARD:
+        lock = _PROCESS_WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PROCESS_WRITE_LOCKS[key] = lock
+        return lock
 
 
 def configure_connection(conn: sqlite3.Connection) -> None:
