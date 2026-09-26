@@ -136,6 +136,57 @@ therefore reports bounded coverage rather than claiming universal pre-bound sour
 - With numpy, the cache is still only for that bounded candidate set and is keyed by canonical
   identity, transactional `data_version`, and candidate ids; it is not a corpus-sized matrix.
 
+### Small hosts: cap the CPU a backfill takes
+
+With a local provider (fastembed, or Ollama on the same box) a backfill is real CPU work, and it
+runs in a background thread **while your agent is answering you**. By default the ONNX runtime
+takes every core for the duration of a batch, so a 2-core host has nothing left for the
+interactive turn. Set:
+
+```bash
+TROVE_EMBEDDING_THREADS=1
+```
+
+Measured on a 2-core host, one config per process (the ONNX thread pool is global, so measuring
+both in one process would contaminate the second reading):
+
+| `TROVE_EMBEDDING_THREADS` | 64 texts, wall | 64 texts, CPU | cores in use |
+|---|---|---|---|
+| unset (`0`) | 4.222s | 8.292s | ~1.96 |
+| `1` | 7.967s | 7.954s | ~1.00 |
+
+The trade is **wall-clock, not total CPU** — same CPU-seconds, about 1.9x slower per batch, and
+the backfill yields half the machine. A backlog therefore drains in more, shorter passes; the
+worker re-arms itself while work remains, so it still completes unattended. `0` (the default)
+omits the argument entirely rather than passing `0`, so behaviour on hosts that do not set it is
+byte-identical. Ignored when the provider is not fastembed — voyage and ollama take no such
+argument.
+
+The cap is applied when the model session is constructed, not per call, because fastembed builds
+the ONNX session once and reuses it. Change it and restart the process.
+
+### When the auto-backfill does not run
+
+The background worker arms a debounce timer after each completed turn, and a new turn re-arms it.
+During a rapid back-and-forth the timer keeps being reset, so the run only starts once messages
+stop for `TROVE_EMBED_AUTO_BACKFILL_DEBOUNCE_S` (default 30). On an active host lower it:
+
+```bash
+TROVE_EMBED_AUTO_BACKFILL_DEBOUNCE_S=5
+```
+
+A run already in progress is never cancelled by a new message — it queues one follow-up pass
+instead — and a run that finds more work re-arms itself, so once it starts the backlog drains
+without further messages. A manual `/trove embed backfill --apply` and the worker share one
+lease, so they exclude each other rather than double-embedding; if you run one while the other
+holds the lease you get `refused: another embedding backfill holds the lease`, which clears when
+that run exits or its `TROVE_EMBEDDING_BACKFILL_LEASE_TTL_S` expires.
+
+A backfill is a background best-effort job, not a queue: there is no persistence across a
+process restart, so if you need coverage guaranteed at a point in time, run
+`/trove embed backfill --corpus both --apply` yourself. It is resumable and idempotent, and stops
+cleanly between batches at `TROVE_EMBEDDING_BACKFILL_BUDGET_S`, so repeating it is safe.
+
 ## Switching or removing providers
 
 Change provider/model → run `/trove embed warmup` (registers the new profile as the current identity)
