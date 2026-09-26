@@ -451,6 +451,50 @@ def test_chunk_auto_backfill_reports_more_work(tmp_path, monkeypatch):
     assert scheduler._do_auto_chunk_backfill(engine) is False
 
 
+def test_chunk_auto_backfill_rearms_when_report_has_no_remaining_line(
+    tmp_path, monkeypatch
+):
+    """A report with no `remaining:` line means UNKNOWN, not "nothing to do".
+
+    `_chunk_backfill_text` returns a `_refused(...)` report — no `remaining:` key at
+    all — whenever it cannot run: lease held, provider unconfigured, DB unreadable,
+    dtype mismatch. Parsing the absent key as 0 read as "backlog clear" and stopped
+    the re-arm loop with thousands of rows pending. Only an explicit
+    `remaining: 0` may end the loop.
+    """
+    engine = _engine(tmp_path, enabled=True, auto_backfill=True, chunk_auto_backfill=True)
+    _seed(engine, 1)
+
+    scheduler = _fresh_scheduler()
+    monkeypatch.setattr(worker_mod, "_EMBED_AUTO_BACKFILL_SCHEDULER", scheduler)
+
+    # Verbatim shape of command._chunk_backfill_text's _refused() return.
+    refused = "\n".join(
+        [
+            "TROVE chunk backfill",
+            "mode: apply",
+            "corpus: chunks",
+            "policy: conversational",
+            "status: refused",
+            "error: another embedding backfill holds the lease; retry after it exits",
+        ]
+    )
+    monkeypatch.setattr(command_mod, "_chunk_backfill_text", lambda *a, **k: refused)
+    assert scheduler._do_auto_chunk_backfill(engine) is True
+
+    # A count that is present but unparseable is likewise unknown, not zero.
+    monkeypatch.setattr(
+        command_mod, "_chunk_backfill_text", lambda *a, **k: "status: partial\nremaining: n/a\n"
+    )
+    assert scheduler._do_auto_chunk_backfill(engine) is True
+
+    # Only an explicit zero ends the loop.
+    monkeypatch.setattr(
+        command_mod, "_chunk_backfill_text", lambda *a, **k: "status: complete\nremaining: 0\n"
+    )
+    assert scheduler._do_auto_chunk_backfill(engine) is False
+
+
 def test_chunk_backlog_rearms_even_when_summary_pass_has_nothing_pending(
     tmp_path, monkeypatch
 ):

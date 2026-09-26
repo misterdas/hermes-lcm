@@ -331,15 +331,21 @@ class _EmbedAutoBackfillScheduler:
             expected_dtype=None,
         )
         remaining = 0
+        parsed = False
         for line in str(report).splitlines():
             if line.startswith("remaining:"):
                 try:
                     remaining = int(line.split(":", 1)[1].strip())
+                    parsed = True
                 except ValueError:
                     remaining = 0
                 break
+        # Only an EXPLICIT `remaining: 0` means "done". A refused report (lease
+        # held, provider missing, DB unavailable) carries no `remaining:` line at
+        # all, and reading that as 0 told the scheduler the backlog was clear
+        # while thousands of rows waited. Unknown => retry on the next debounce.
         logger.debug("TROVE auto chunk-backfill: %d remaining", remaining)
-        return remaining > 0
+        return remaining > 0 if parsed else True
 
     def shutdown(self) -> None:
         """Stop accepting new debounces.
