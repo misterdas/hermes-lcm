@@ -61,7 +61,6 @@ from .message_content import normalize_content_value as _normalize_content_value
 from .sqlite_util import (
     _prepare_private_sqlite_file,
     _remove_stale_shm_sidecar,
-    _restrict_existing_sqlite_artifacts,
     _temporary_sqlite_busy_timeout,
     startup_index_self_heal,
 )
@@ -429,7 +428,6 @@ class MessageStore:
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         if not self._is_memory_database:
-            _restrict_existing_sqlite_artifacts(self.db_path)
             # Startup index self-heal (t2): under multi-process WAL
             # concurrency a b-tree index can lose a row entry while the row
             # itself survives. integrity_check is the only pragma that catches
