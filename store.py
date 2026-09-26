@@ -34,6 +34,7 @@ from .db_bootstrap import (
     repair_external_content_fts,
     run_message_identity_migration,
     run_versioned_migrations,
+    write_transaction,
 )
 from .config import TROVEConfig
 from .ingest_protection import protect_message_for_ingest, protect_messages_for_ingest
@@ -697,25 +698,33 @@ class MessageStore:
         ingested_at = time.time()
 
         def _insert_single() -> int:
-            store_id = self._insert_message_conflict_safe(
-                (
-                    session_id,
-                    _normalize_source_value(source),
-                    _normalize_conversation_id_value(conversation_id),
-                    msg.get("role", "unknown"),
-                    _normalize_content_value(msg.get("content")),
-                    msg.get("tool_call_id"),
-                    tc_json,
-                    msg.get("tool_name"),
-                    ingested_at,
-                    token_estimate,
-                    0,
-                    ingested_at,
-                    observed_at,
-                    "host_message_timestamp" if observed_at is not None else None,
+            # BEGIN IMMEDIATE (not Python's default DEFERRED): under
+            # cross-process contention a deferred transaction takes a SHARED
+            # lock then upgrades at commit, and two writers upgrading at once
+            # produce an un-retryable "database is locked" mid-append. Taking
+            # the write lock up front resolves contention once, where the
+            # busy handler can see it. See db_bootstrap.write_transaction.
+            with write_transaction(self._conn):
+                store_id = self._insert_message_conflict_safe(
+                    (
+                        session_id,
+                        _normalize_source_value(source),
+                        _normalize_conversation_id_value(conversation_id),
+                        msg.get("role", "unknown"),
+                        _normalize_content_value(msg.get("content")),
+                        msg.get("tool_call_id"),
+                        tc_json,
+                        msg.get("tool_name"),
+                        ingested_at,
+                        token_estimate,
+                        0,
+                        ingested_at,
+                        observed_at,
+                        "host_message_timestamp" if observed_at is not None else None,
+                    )
                 )
-            )
-            self._conn.commit()
+                store_id = int(store_id) if store_id is not None else 0
+                self._conn.commit()
             return store_id
 
         with self.write_guard():
